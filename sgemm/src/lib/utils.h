@@ -1,6 +1,16 @@
 #pragma once
+
+#include <stdio.h>
 #include <string>
 #include <chrono>
+#include <random>
+#include <iostream>
+#include <cassert>
+#include <stdexcept>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cublas_api.h>
 
 using std::chrono::duration_cast;
 using std::chrono::duration;
@@ -12,17 +22,15 @@ using std::endl;
 using std::string;
 
 
-template<class T>
-T MyRand(const T & min, const T & max) {
+float MyRand(const float & min, const float & max) {
     static thread_local std::mt19937 generator;
-    std::uniform_real_distribution<T> distribution(min,max);
+    std::uniform_real_distribution<float> distribution(min,max);
     return distribution(generator);
 }
 
-template<class T>
-void GenerateRandomMatrix(T* input, size_t input_length) {
+void GenerateRandomMatrix(float* input, size_t input_length) {
   for(int i = 0; i < input_length; ++i) {
-    input[i] = MyRand<T>(-1.0f, 1.0f);
+    input[i] = MyRand(-1.0f, 1.0f);
   }
 }
 
