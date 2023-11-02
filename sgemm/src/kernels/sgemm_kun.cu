@@ -224,6 +224,20 @@ __global__ void Sgemm(
     }
 }
 
+void run_kun(float* gpu_A, float* gpu_B, float* gpu_C, size_t M, size_t N, size_t K) {
+    static const int BLOCK_SIZE_M = 128;
+    static const int BLOCK_SIZE_K = 8;
+    static const int BLOCK_SIZE_N = 128;
+    static const int THREAD_SIZE_X = 8;
+    static const int THREAD_SIZE_Y = 8;
+    static const bool ENABLE_DOUBLE_BUFFER = false;
+
+    dim3 dimBlock(BLOCK_SIZE_N / THREAD_SIZE_X, BLOCK_SIZE_M / THREAD_SIZE_Y);
+    dim3 dimGrid(N / BLOCK_SIZE_N, M / BLOCK_SIZE_M);
+    Sgemm<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
+    <<< dimGrid, dimBlock >>>(gpu_A, gpu_B, gpu_C, M, N, K);
+}
+
 int kun_main(int argc, char** argv) {
     if (argc != 4) {
         printf("usage: ./main [M] [K] [N]\n");

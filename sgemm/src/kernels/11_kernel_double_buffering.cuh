@@ -7,8 +7,6 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
 namespace db {
 
 template <const int BM, const int BN, const int BK, const int rowStrideA,
@@ -217,4 +215,65 @@ __global__ void __launch_bounds__(NUM_THREADS)
       }
     }
   }
+}
+
+void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
+                             float *B, float beta, float *C) {
+  // Settings for A100
+  // const uint K11_NUM_THREADS = 256;
+  // const uint K11_BN = 128;
+  // const uint K11_BM = 64;
+  // const uint K11_BK = 16;
+  // const uint K11_WN = 32;
+  // const uint K11_WM = 32;
+  // const uint K11_WNITER = 2;
+  // const uint K11_TN = 4;
+  // const uint K11_TM = 4;
+  // Settings for A6000
+  const uint K11_NUM_THREADS = 256;
+  const uint K11_BN = 256;
+  const uint K11_BM = 128;
+  const uint K11_BK = 16;
+  const uint K11_WN = 32;
+  const uint K11_WM = 128;
+  const uint K11_WNITER = 1;
+  const uint K11_TN = 8;
+  const uint K11_TM = 8;
+  dim3 blockDim(K11_NUM_THREADS);
+
+  constexpr uint NUM_WARPS = K11_NUM_THREADS / 32;
+
+  // warptile in threadblocktile
+  static_assert((K11_BN % K11_WN == 0) and (K11_BM % K11_WM == 0));
+  static_assert((K11_BN / K11_WN) * (K11_BM / K11_WM) == NUM_WARPS);
+
+  // threads in warpsubtile
+  static_assert((K11_WM * K11_WN) % (WARPSIZE * K11_TM * K11_TN * K11_WNITER) ==
+                0);
+  constexpr uint K11_WMITER =
+      (K11_WM * K11_WN) / (32 * K11_TM * K11_TN * K11_WNITER);
+  // warpsubtile in warptile
+  static_assert((K11_WM % K11_WMITER == 0) and (K11_WN % K11_WNITER == 0));
+
+  static_assert((K11_NUM_THREADS / 2 * 4) % K11_BK == 0,
+                "NUM_THREADS*4 must be multiple of BK to avoid quantization "
+                "issues during GMEM->SMEM tiling (loading only parts of the "
+                "final row of Bs during each iteraion)");
+  static_assert((K11_NUM_THREADS / 2 * 4) % K11_BN == 0,
+                "NUM_THREADS*4 must be multiple of BN to avoid quantization "
+                "issues during GMEM->SMEM tiling (loading only parts of the "
+                "final row of As during each iteration)");
+  static_assert(K11_BN % (16 * K11_TN) == 0,
+                "BN must be a multiple of 16*TN to avoid quantization effects");
+  static_assert(K11_BM % (16 * K11_TM) == 0,
+                "BM must be a multiple of 16*TM to avoid quantization effects");
+  static_assert((K11_BM * K11_BK) % (4 * K11_NUM_THREADS / 2) == 0,
+                "BM*BK must be a multiple of 4*256 to vectorize loads");
+  static_assert((K11_BN * K11_BK) % (4 * K11_NUM_THREADS / 2) == 0,
+                "BN*BK must be a multiple of 4*256 to vectorize loads");
+
+  dim3 gridDim(CEIL_DIV(N, K11_BN), CEIL_DIV(M, K11_BM));
+  sgemmDoubleBuffering<K11_BM, K11_BN, K11_BK, K11_WM, K11_WN, K11_WNITER,
+                       K11_TM, K11_TN, K11_NUM_THREADS>
+      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }

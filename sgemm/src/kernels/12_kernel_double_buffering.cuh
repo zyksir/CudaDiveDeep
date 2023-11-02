@@ -9,8 +9,6 @@
 #include <cuda/barrier>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
 namespace {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB, typename T>
@@ -226,4 +224,55 @@ __global__ void __launch_bounds__(NUM_THREADS)
       }
     }
   }
+}
+
+void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
+                              float *B, float beta, float *C) {
+  // Settings for A6000
+  const uint K12_NUM_THREADS = 128;
+  const uint K12_BN = 128;
+  const uint K12_BM = 128;
+  const uint K12_BK = 16;
+  const uint K12_WN = 64;
+  const uint K12_WM = 64;
+  const uint K12_WNITER = 4;
+  const uint K12_TN = 4;
+  const uint K12_TM = 8;
+  dim3 blockDim(K12_NUM_THREADS);
+
+  constexpr uint NUM_WARPS = K12_NUM_THREADS / 32;
+
+  // warptile in threadblocktile
+  static_assert((K12_BN % K12_WN == 0) and (K12_BM % K12_WM == 0));
+  static_assert((K12_BN / K12_WN) * (K12_BM / K12_WM) == NUM_WARPS);
+
+  // threads in warpsubtile
+  static_assert((K12_WM * K12_WN) % (WARPSIZE * K12_TM * K12_TN * K12_WNITER) ==
+                0);
+  constexpr uint K12_WMITER =
+      (K12_WM * K12_WN) / (32 * K12_TM * K12_TN * K12_WNITER);
+  // warpsubtile in warptile
+  static_assert((K12_WM % K12_WMITER == 0) and (K12_WN % K12_WNITER == 0));
+
+  static_assert((K12_NUM_THREADS * 4) % K12_BK == 0,
+                "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
+                "issues during GMEM->SMEM tiling (loading only parts of the "
+                "final row of Bs during each iteraion)");
+  static_assert((K12_NUM_THREADS * 4) % K12_BN == 0,
+                "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
+                "issues during GMEM->SMEM tiling (loading only parts of the "
+                "final row of As during each iteration)");
+  static_assert(K12_BN % (16 * K12_TN) == 0,
+                "BN must be a multiple of 16*TN to avoid quantization effects");
+  static_assert(K12_BM % (16 * K12_TM) == 0,
+                "BM must be a multiple of 16*TM to avoid quantization effects");
+  static_assert((K12_BM * K12_BK) % (4 * K12_NUM_THREADS) == 0,
+                "BM*BK must be a multiple of 4*256 to vectorize loads");
+  static_assert((K12_BN * K12_BK) % (4 * K12_NUM_THREADS) == 0,
+                "BN*BK must be a multiple of 4*256 to vectorize loads");
+
+  dim3 gridDim(CEIL_DIV(N, K12_BN), CEIL_DIV(M, K12_BM));
+  runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
+                           K12_TM, K12_TN, K12_NUM_THREADS>
+      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }

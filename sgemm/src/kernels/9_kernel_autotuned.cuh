@@ -125,3 +125,45 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
     }
   }
 }
+
+void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
+                       float beta, float *C) {
+  // A100
+  // const uint K9_BK = 16;
+  // const uint K9_TM = 4;
+  // const uint K9_TN = 4;
+  // const uint K9_BM = 64;
+  // const uint K9_BN = 64;
+  // A6000
+  const uint K9_BK = 16;
+  const uint K9_TM = 8;
+  const uint K9_TN = 8;
+  const uint K9_BM = 128;
+  const uint K9_BN = 128;
+  dim3 blockDim(K9_NUM_THREADS);
+
+  static_assert(
+      (K9_NUM_THREADS * 4) % K9_BK == 0,
+      "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization issues "
+      "during GMEM->SMEM tiling (loading only parts of the final row of Bs "
+      "during each iteraion)");
+  static_assert(
+      (K9_NUM_THREADS * 4) % K9_BN == 0,
+      "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization issues "
+      "during GMEM->SMEM tiling (loading only parts of the final row of As "
+      "during each iteration)");
+  static_assert(
+      K9_BN % (16 * K9_TN) == 0,
+      "K9_BN must be a multiple of 16*K9_TN to avoid quantization effects");
+  static_assert(
+      K9_BM % (16 * K9_TM) == 0,
+      "K9_BM must be a multiple of 16*K9_TM to avoid quantization effects");
+  static_assert((K9_BM * K9_BK) % (4 * K9_NUM_THREADS) == 0,
+                "K9_BM*K9_BK must be a multiple of 4*256 to vectorize loads");
+  static_assert((K9_BN * K9_BK) % (4 * K9_NUM_THREADS) == 0,
+                "K9_BN*K9_BK must be a multiple of 4*256 to vectorize loads");
+
+  dim3 gridDim(CEIL_DIV(N, K9_BN), CEIL_DIV(M, K9_BM));
+  sgemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
+      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+}

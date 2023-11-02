@@ -7,11 +7,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
-    sgemm2DBlocktiling(int M, int N, int K, float alpha, const float *A,
+    sgemm2DBlocktiling_mine(int M, int N, int K, float alpha, const float *A,
                        const float *B, float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
@@ -28,8 +26,8 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   const int threadRow = threadIdx.x / (BN / TN);
 
   // allocate space for the current blocktile in smem
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  __shared__ float As[BM][BK];
+  __shared__ float Bs[BK][BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -50,7 +48,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   const uint strideB = numThreadsBlocktile / BN;
 
   // allocate thread-local cache for results in registerfile
-  float threadResults[TM * TN] = {0.0};
+  float threadResults[TM][TN] = {0.0};
   // register caches for As and Bs
   float regM[TM] = {0.0};
   float regN[TN] = {0.0};
@@ -59,11 +57,11 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // populate the SMEM caches
     for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
-      As[(innerRowA + loadOffset) * BK + innerColA] =
+      As[innerRowA + loadOffset][innerColA] =
           A[(innerRowA + loadOffset) * K + innerColA];
     }
     for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
-      Bs[(innerRowB + loadOffset) * BN + innerColB] =
+      Bs[innerRowB + loadOffset][innerColB] =
           B[(innerRowB + loadOffset) * N + innerColB];
     }
     __syncthreads();
@@ -76,14 +74,14 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
       // block into registers
       for (uint i = 0; i < TM; ++i) {
-        regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+        regM[i] = As[threadRow * TM + i][dotIdx];
       }
       for (uint i = 0; i < TN; ++i) {
-        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+        regN[i] = Bs[dotIdx][threadCol * TN + i];
       }
       for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-          threadResults[resIdxM * TN + resIdxN] +=
+          threadResults[resIdxM][resIdxN] +=
               regM[resIdxM] * regN[resIdxN];
         }
       }
@@ -95,8 +93,32 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
     for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
       C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
-          alpha * threadResults[resIdxM * TN + resIdxN] +
+          alpha * threadResults[resIdxM][resIdxN] +
           beta * C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
     }
+  }
+}
+
+void runSgemm2DBlocktiling_mine(int M, int N, int K, float alpha, float *A, float *B,
+                           float beta, float *C) {
+  const uint BK = 8;
+  const uint TM = 8;
+  const uint TN = 8;
+  if (M >= 128 and N >= 128) {
+    const uint BM = 128;
+    const uint BN = 128;
+    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    dim3 blockDim((BM * BN) / (TM * TN));
+    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
+        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  } else {
+    // this is a hacky solution to the underlying problem
+    // of not having proper bounds checking in the kernel
+    const uint BM = 64;
+    const uint BN = 64;
+    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    dim3 blockDim((BM * BN) / (TM * TN));
+    sgemm2DBlocktiling_mine<BM, BN, BK, TM, TN>
+        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }

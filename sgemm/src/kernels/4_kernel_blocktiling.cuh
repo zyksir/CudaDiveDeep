@@ -7,13 +7,19 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
-                               float *B, float beta, float *C) {
+__global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
+    sgemm2DBlocktiling(int M, int N, int K, float alpha, const float *A,
+                       const float *B, float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
+
+  const uint totalResultsBlocktile = BM * BN;
+  // A thread is responsible for calculating TM*TN elements in the blocktile
+  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN);
+
+  // ResultsPerBlock / ResultsPerThread == ThreadsPerBlock
+  assert(numThreadsBlocktile == blockDim.x);
 
   // BN/TN are the number of threads to span a column
   const int threadCol = threadIdx.x % (BN / TN);
@@ -29,30 +35,35 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
   C += cRow * BM * N + cCol * BN;
 
   // calculating the indices that this thread will load into SMEM
-  // we'll load 128bit / 32bit = 4 elements per thread at each step
-  const uint innerRowA = threadIdx.x / (BK / 4);
-  const uint innerColA = threadIdx.x % (BK / 4);
-  const uint innerRowB = threadIdx.x / (BN / 4);
-  const uint innerColB = threadIdx.x % (BN / 4);
+  const uint innerRowA = threadIdx.x / BK;
+  const uint innerColA = threadIdx.x % BK;
+  // calculates the number of rows of As that are being loaded in a single step
+  // by a single block
+  const uint strideA = numThreadsBlocktile / BK;
+  const uint innerRowB = threadIdx.x / BN;
+  const uint innerColB = threadIdx.x % BN;
+  // for both As and Bs we want each load to span the full column-width, for
+  // better GMEM coalescing (as opposed to spanning full row-width and iterating
+  // across columns)
+  const uint strideB = numThreadsBlocktile / BN;
 
   // allocate thread-local cache for results in registerfile
   float threadResults[TM * TN] = {0.0};
+  // register caches for As and Bs
   float regM[TM] = {0.0};
   float regN[TN] = {0.0};
 
   // outer-most loop over block tiles
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // populate the SMEM caches
-    // transpose A while loading it
-    float4 tmp =
-        reinterpret_cast<float4 *>(&A[innerRowA * K + innerColA * 4])[0];
-    As[(innerColA * 4 + 0) * BM + innerRowA] = tmp.x;
-    As[(innerColA * 4 + 1) * BM + innerRowA] = tmp.y;
-    As[(innerColA * 4 + 2) * BM + innerRowA] = tmp.z;
-    As[(innerColA * 4 + 3) * BM + innerRowA] = tmp.w;
-
-    reinterpret_cast<float4 *>(&Bs[innerRowB * BN + innerColB * 4])[0] =
-        reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
+    for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+      As[(innerRowA + loadOffset) * BK + innerColA] =
+          A[(innerRowA + loadOffset) * K + innerColA];
+    }
+    for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
+      Bs[(innerRowB + loadOffset) * BN + innerColB] =
+          B[(innerRowB + loadOffset) * N + innerColB];
+    }
     __syncthreads();
 
     // advance blocktile
@@ -63,7 +74,7 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
     for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
       // block into registers
       for (uint i = 0; i < TM; ++i) {
-        regM[i] = As[dotIdx * BM + threadRow * TM + i];
+        regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
       }
       for (uint i = 0; i < TN; ++i) {
         regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
@@ -79,26 +90,17 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
   }
 
   // write out the results
-  for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
-    for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
-      // load C vector into registers
-      float4 tmp = reinterpret_cast<float4 *>(
-          &C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN])[0];
-      // perform GEMM update in reg
-      tmp.x = alpha * threadResults[resIdxM * TN + resIdxN] + beta * tmp.x;
-      tmp.y = alpha * threadResults[resIdxM * TN + resIdxN + 1] + beta * tmp.y;
-      tmp.z = alpha * threadResults[resIdxM * TN + resIdxN + 2] + beta * tmp.z;
-      tmp.w = alpha * threadResults[resIdxM * TN + resIdxN + 3] + beta * tmp.w;
-      // write back
-      reinterpret_cast<float4 *>(
-          &C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN])[0] =
-          tmp;
+  for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+      C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
+          alpha * threadResults[resIdxM * TN + resIdxN] +
+          beta * C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
     }
   }
 }
 
-void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
-                       float beta, float *C) {
+void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
+                           float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
   const uint TN = 8;
@@ -107,7 +109,7 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -116,7 +118,7 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }

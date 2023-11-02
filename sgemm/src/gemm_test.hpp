@@ -48,36 +48,30 @@ public:
         CUDA_CHECK(cudaMalloc((void **)&gpu_A, M * K * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&gpu_B, K * N * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&gpu_C, M * N * sizeof(float)));
-        cublasStatus_t stat;   // cuBLAS functions status
         cublasHandle_t handle; // cuBLAS context
-        stat = cublasCreate(&handle); // initialize CUBLAS context
+        cublasCreate(&handle);
         cudaMemcpy(gpu_A, cpu_A, M * K * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_B, cpu_B, K * N * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_C, cpu_C, M * N * sizeof(float), cudaMemcpyHostToDevice);
         float alpha = 1.0f;
         float beta = 0.0f;
-
-        // warmup
-        stat = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, 
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, 
             &alpha, gpu_B, N, gpu_A, K, &beta, gpu_C, N);
-		cuda_event_record();
-		for(int i = 0; i < repeat_nums; i++) {
-            stat = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, 
-                &alpha, gpu_B, N, gpu_A, K, &beta, gpu_C, N);
-        }
-		float elapsed_ms = cuda_event_stop();
-		std::chrono::nanoseconds gpu_duration((uint64_t)(elapsed_ms * 1e6));
-		print_performance_result(gpu_duration, "cublas");
+        cudaDeviceSynchronize();
         cudaMemcpy(cublas_output, gpu_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
         baseline_runned = true;
     }
     void run_cuda(decltype(foo) cuda_func, string kernel_name) {
+        if (!baseline_runned) {
+            run_baseline();
+            return;
+        }
         cudaMemcpy(gpu_A, cpu_A, M * K * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_B, cpu_B, K * N * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_C, cpu_C, M * N * sizeof(float), cudaMemcpyHostToDevice);
         cuda_func(gpu_A, gpu_B, gpu_C, M, N, K);
         cudaMemcpy(my_output, gpu_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-        if (is_diff_matrix(my_output, cublas_output, M * N)) {
+        if (is_diff_matrix(cublas_output, my_output, M * N)) {
             return;
         }
 
