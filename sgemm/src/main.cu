@@ -11,10 +11,13 @@
 #include "kernels/4_kernel_blocktiling.cuh"
 #include "kernels/4_kernel_blocktiling_mine.cuh"
 #include "kernels/6_kernel_vectorize.cuh"
+#include "kernels/6_kernel_vectorize_mine.cuh"
 #include "kernels/7_kernel_resolve_bank_conflicts.cuh"
 #include "kernels/8_kernel_bank_extra_col.cuh"
 #include "kernels/9_kernel_autotuned.cuh"
 #include "kernels/10_kernel_warptiling.cuh"
+#include "kernels/11_kernel_double_buffering.cuh"
+// #include "kernels/12_kernel_double_buffering.cuh"
 
 void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
@@ -115,6 +118,9 @@ int main() {
       runSgemmVectorize(M, N, K, 1.0, A, B, 0.0, C);
     }, "v6_vectorize");
     sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      runSgemmVectorize_mine(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v6_vectorize_mine");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
       runSgemmResolveBankConflicts(M, N, K, 1.0, A, B, 0.0, C);
     }, "v7_bank_conflict");
     sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
@@ -126,6 +132,12 @@ int main() {
     sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
       runSgemmWarptiling(M, N, K, 1.0, A, B, 0.0, C);
     }, "v10_warptiling");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      runSgemmDoubleBuffering(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v11_doublebuffering");
+    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+    //   runSgemmDoubleBuffering2(M, N, K, 1.0, A, B, 0.0, C);
+    // }, "v12_doublebuffering2");
 
   }
   return 0;
