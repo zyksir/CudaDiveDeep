@@ -10,6 +10,8 @@
 
 // cal offset from row col and ld , in row-major matrix, ld is the width of the matrix
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
+static const float alpha = 1.0;
+static const float beta = 0.0;
 
 // transfer float4
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
@@ -216,10 +218,24 @@ __global__ void Sgemm(
     for (int thread_y = 0; thread_y < THREAD_SIZE_Y; ++thread_y) {
         #pragma unroll
         for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x+=4) {
+            float4 tmp = FETCH_FLOAT4(C[OFFSET(
+                BLOCK_SIZE_M * by + ty * THREAD_SIZE_Y + thread_y,
+                BLOCK_SIZE_N * bx + tx * THREAD_SIZE_X + thread_x,
+                N)]);
+            // perform GEMM update in reg
+            tmp.x = alpha * accum[thread_y][thread_x] + beta * tmp.x;
+            tmp.y = alpha * accum[thread_y][thread_x+1] + beta * tmp.y;
+            tmp.z = alpha * accum[thread_y][thread_x+2] + beta * tmp.z;
+            tmp.w = alpha * accum[thread_y][thread_x+3] + beta * tmp.w;
+            // write back
             FETCH_FLOAT4(C[OFFSET(
                 BLOCK_SIZE_M * by + ty * THREAD_SIZE_Y + thread_y,
                 BLOCK_SIZE_N * bx + tx * THREAD_SIZE_X + thread_x,
-                N)]) = FETCH_FLOAT4(accum[thread_y][thread_x]);
+                N)]) = tmp;
+            // FETCH_FLOAT4(C[OFFSET(
+            //     BLOCK_SIZE_M * by + ty * THREAD_SIZE_Y + thread_y,
+            //     BLOCK_SIZE_N * bx + tx * THREAD_SIZE_X + thread_x,
+            //     N)]) = FETCH_FLOAT4(accum[thread_y][thread_x]);
         }
     }
 }
