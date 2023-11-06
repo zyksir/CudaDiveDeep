@@ -2,9 +2,9 @@
 #include <stdlib.h>
 #include <float.h>
 #include <cuda_runtime.h>
+#include "../lib/macros.cuh" 
 
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
-#define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 __global__ void sgemm_ziqi(
     float * __restrict__ a, float * __restrict__ b, float * __restrict__ c,

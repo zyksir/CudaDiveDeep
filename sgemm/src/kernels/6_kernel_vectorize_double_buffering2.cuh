@@ -6,10 +6,7 @@
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-
-#define OFFSET(row, col, ld) ((row) * (ld) + (col))
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "../lib/macros.cuh" 
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN, 
     const int TX=BM/TM, const int TY=BN/TN, const int THREAD_NUM_PER_BLOCK=TX*TY>
@@ -28,8 +25,8 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // const int tid = threadRow * TX + threadCol;
 
   // allocate space for the current blocktile in smem
-  __shared__ float As[2][BK][BM];
-  __shared__ float Bs[2][BK][BN];
+  __shared__ float As[2*BK*BM];
+  __shared__ float Bs[2*BK*BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -51,36 +48,36 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
   // allocate thread-local cache for results in registerfile
-  float threadResults[TM][TN] = {0.0};
+  float threadResults[TM*TN] = {0.0};
   // register caches for As and Bs
-  float regA[2][TM] = {0.0};
-  float regB[2][TN] = {0.0};
+  float regA[2*TM] = {0.0};
+  float regB[2*TN] = {0.0};
 
   // Step0. Preload
   // Stage0.1: Load Block from global memory to register and from register to shared memory
   #pragma unroll
   for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
     int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-      FETCH_FLOAT4(ldg_A_reg[ldg_index]) = 
-        FETCH_FLOAT4(A[OFFSET(A_TILE_ROW_START + i, A_TILE_COL, K )]);
-      As[0][A_TILE_COL][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index];
-      As[0][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+1];
-      As[0][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+2];
-      As[0][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+3];
+      FLOAT4(ldg_A_reg[ldg_index]) = 
+        FLOAT4(Val(A, A_TILE_ROW_START + i, A_TILE_COL, K ));
+      Val3D(As, 0, A_TILE_COL, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index];
+      Val3D(As, 0, A_TILE_COL+1, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+1];
+      Val3D(As, 0, A_TILE_COL+2, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+2];
+      Val3D(As, 0, A_TILE_COL+3, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+3];
   }
   #pragma unroll
   for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
-    FETCH_FLOAT4(Bs[0][B_TILE_ROW_START + i][B_TILE_COL]) = 
-      FETCH_FLOAT4(B[OFFSET(B_TILE_ROW_START + i, B_TILE_COL, N)]);
+    FLOAT4(Val3D(Bs, 0, B_TILE_ROW_START + i, B_TILE_COL, BK, BN)) = 
+      FLOAT4(Val(B, B_TILE_ROW_START + i, B_TILE_COL, N));
   }
   __syncthreads();
   // Stage0.2: Load Tile from shared memory to register
   for (uint i = 0; i < TM; i+=4) {
-    FETCH_FLOAT4(regA[0][i]) = FETCH_FLOAT4(As[0][0][threadRow * TM + i]);
+    FLOAT4(Val(regA, 0, i, TM)) = FLOAT4(Val3D(As, 0, 0, threadRow * TM + i, BK, BM));
   }
   #pragma unroll
   for (uint i = 0; i < TN; i+=4) {
-    FETCH_FLOAT4(regB[0][i]) = FETCH_FLOAT4(Bs[0][0][threadCol * TN + i]);
+    FLOAT4(Val(regB, 0, i, TN)) = FLOAT4(Val3D(Bs, 0, 0, threadCol * TN + i, BK, BN));
   }
   int write_stage_idx = 1;
   int tile_idx = 0;
@@ -90,14 +87,14 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
       #pragma unroll
       for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
         int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-        FETCH_FLOAT4(ldg_A_reg[ldg_index]) = 
-          FETCH_FLOAT4(A[OFFSET(A_TILE_ROW_START + i, A_TILE_COL + tile_idx, K)]);
+        FLOAT4(ldg_A_reg[ldg_index]) = 
+          FLOAT4(Val(A, A_TILE_ROW_START + i, A_TILE_COL + tile_idx, K));
       }
       #pragma unroll
       for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
         int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-        FETCH_FLOAT4(ldg_B_reg[ldg_index]) = 
-          FETCH_FLOAT4(B[OFFSET(tile_idx + B_TILE_ROW_START + i, B_TILE_COL, N)]);
+        FLOAT4(ldg_B_reg[ldg_index]) = 
+          FLOAT4(Val(B, tile_idx + B_TILE_ROW_START + i, B_TILE_COL, N));
       }
     }
     int load_stage_idx = write_stage_idx ^ 1;
@@ -107,18 +104,19 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
       // load from the current shared memory block
       #pragma unroll
       for (uint i = 0; i < TM; i+=4) {
-        FETCH_FLOAT4(regA[(dotIdx+1)%2][i]) = FETCH_FLOAT4(As[load_stage_idx][dotIdx+1][threadRow * TM + i]);
+        FLOAT4(Val(regA, (dotIdx+1)%2, i, TM)) = FLOAT4(Val3D(As, load_stage_idx, dotIdx+1, threadRow * TM + i, BK, BM));
       }
       #pragma unroll
       for (uint i = 0; i < TN; i+=4) {
-        FETCH_FLOAT4(regB[(dotIdx+1)%2][i]) = FETCH_FLOAT4(Bs[load_stage_idx][dotIdx+1][threadCol * TN + i]);
+        FLOAT4(Val(regB, (dotIdx+1)%2, i, TN)) = FLOAT4(Val3D(Bs, load_stage_idx, dotIdx+1, threadCol * TN + i, BK, BN));
       }
       // Stage1.2.2: Compute current tile
       #pragma unroll
       for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
         #pragma unroll
         for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-          threadResults[resIdxM][resIdxN] += regA[dotIdx%2][resIdxM] * regB[dotIdx%2][resIdxN];
+          Val(threadResults, resIdxM, resIdxN, TN) += 
+            Val(regA, dotIdx%2, resIdxM, TM) * Val(regB, dotIdx%2, resIdxN, TN);
         }
       }
     }
@@ -127,15 +125,16 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
       #pragma unroll
       for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
         int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-        As[write_stage_idx][A_TILE_COL][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index];
-        As[write_stage_idx][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+1];
-        As[write_stage_idx][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+2];
-        As[write_stage_idx][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+3];
+        Val3D(As, write_stage_idx, A_TILE_COL, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index];
+        Val3D(As, write_stage_idx, A_TILE_COL+1, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+1];
+        Val3D(As, write_stage_idx, A_TILE_COL+2, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+2];
+        Val3D(As, write_stage_idx, A_TILE_COL+3, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+3];
       }
       #pragma unroll
       for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
         int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-        FETCH_FLOAT4(Bs[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(ldg_B_reg[ldg_index]);
+        FLOAT4(Val3D(Bs, write_stage_idx, B_TILE_ROW_START + i, B_TILE_COL, BK, BN)) = 
+          FLOAT4(ldg_B_reg[ldg_index]);
       }
       __syncthreads();
       write_stage_idx ^= 1;
@@ -143,18 +142,19 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     
     #pragma unroll
     for (uint i = 0; i < TM; i+=4) {
-      FETCH_FLOAT4(regA[0][i]) = FETCH_FLOAT4(As[load_stage_idx^1][0][threadRow * TM + i]);
+      FLOAT4(Val(regA, 0, i, TM)) = FLOAT4(Val3D(As, load_stage_idx^1, 0, threadRow * TM + i, BK, BM));
     }
     #pragma unroll
     for (uint i = 0; i < TN; i+=4) {
-      FETCH_FLOAT4(regB[0][i]) = FETCH_FLOAT4(Bs[load_stage_idx^1][0][threadCol * TN + i]);
+      FLOAT4(Val(regB, 0, i, TN)) = FLOAT4(Val3D(Bs, load_stage_idx^1, 0, threadCol * TN + i, BK, BN));
     }
     // Stage1.5: Compute the last tile of the current block
     #pragma unroll
     for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
       #pragma unroll
       for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-        threadResults[resIdxM][resIdxN] += regA[1][resIdxM] * regB[1][resIdxN];
+        Val(threadResults, resIdxM, resIdxN, TN) += 
+            Val(regA, 1, resIdxM, TM) * Val(regB, 1, resIdxN, TN);
       }
     }
   } while (tile_idx < K);
@@ -163,14 +163,14 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
     #pragma unroll
     for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
-      float4 tmp = FETCH_FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]);
+      float4 tmp = FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]);
       // perform GEMM update in reg
-      tmp.x = alpha * threadResults[resIdxM][resIdxN] + beta * tmp.x;
-      tmp.y = alpha * threadResults[resIdxM][resIdxN + 1] + beta * tmp.y;
-      tmp.z = alpha * threadResults[resIdxM][resIdxN + 2] + beta * tmp.z;
-      tmp.w = alpha * threadResults[resIdxM][resIdxN + 3] + beta * tmp.w;
+      tmp.x = alpha * Val(threadResults, resIdxM, resIdxN, TN) + beta * tmp.x;
+      tmp.y = alpha * Val(threadResults, resIdxM, resIdxN+1, TN) + beta * tmp.y;
+      tmp.z = alpha * Val(threadResults, resIdxM, resIdxN+2, TN) + beta * tmp.z;
+      tmp.w = alpha * Val(threadResults, resIdxM, resIdxN+3, TN) + beta * tmp.w;
       // write back
-      FETCH_FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]) = tmp;
+      FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]) = tmp;
     }
   }
 }
