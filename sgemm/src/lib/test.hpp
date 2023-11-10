@@ -24,10 +24,9 @@ protected:
 	const uint repeat_nums;
     const uint64_t float_calculation_num;
     // print the performance result for the test
-    void print_performance_result(const duration<double>& duration, const string& name) {
-        uint64_t run_time_ms = duration_cast<microseconds>(duration).count();
-        float flops = repeat_nums * float_calculation_num /(run_time_ms * 1e6);
-        clog << "[" << kernel_name + name << "]Pass\tFLOPS:" << flops << "TFLOPS\tTimeCost:" << duration.count()*1e6 / repeat_nums << "us" << std::endl;
+    void print_performance_result(const float elapsed_ms, const string& name) {
+        float flops = repeat_nums * float_calculation_num /(elapsed_ms * 1e9); // TFLOPS means 1e12, while ms means 1e-3
+        clog << "[" << kernel_name + name << "]Pass\tFLOPS:" << flops << "TFLOPS\tTimeCost:" << elapsed_ms / repeat_nums << "ms" << std::endl;
     }
 
     bool is_diff_single_item(float a, float b) {

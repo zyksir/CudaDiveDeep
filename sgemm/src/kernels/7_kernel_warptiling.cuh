@@ -8,84 +8,6 @@
 #include <cuda_runtime.h>
 #include "../lib/macros.cuh" 
 
-// static const int WARPSIZE = 32; // warpSize is not constexpr
-namespace wt_mine {
-template <const int BM, const int BN, const int BK, const int rowStrideA,
-          const int rowStrideB>
-__device__ void loadFromGmem(int N, int K, const float *A, const float *B,
-                             float *As, float *Bs, int innerRowA, int innerColA,
-                             int innerRowB, int innerColB) {
-  for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
-    const float4 tmp = reinterpret_cast<const float4 *>(
-        &A[(innerRowA + offset) * K + innerColA * 4])[0];
-    // float4 tmp;
-    // asm("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
-    //     : "=f"(tmp.x), "=f"(tmp.y), "=f"(tmp.z), "=f"(tmp.w)
-    //     : "l"(&A[(innerRowA + offset) * K + innerColA * 4]));
-    As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
-    As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
-    As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
-    As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
-  }
-
-  for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
-    reinterpret_cast<float4 *>(
-        &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
-        reinterpret_cast<const float4 *>(
-            &B[(innerRowB + offset) * N + innerColB * 4])[0];
-    // asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-    //     : "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 0]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 1]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 2]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 3])
-    //     : "l"(&B[(innerRowB + offset) * N + innerColB * 4]));
-  }
-}
-
-template <const int BM, const int BN, const int BK, const int WM, const int WN,
-          const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
-          const int TM, const int TN>
-__device__ void
-processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
-                const float *Bs, const uint warpRow, const uint warpCol,
-                const uint threadRowInWarp, const uint threadColInWarp) {
-  for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
-    // populate registers for whole warptile
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-      for (uint i = 0; i < TM; ++i) {
-        regM[wSubRowIdx * TM + i] =
-            As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
-               threadRowInWarp * TM + i];
-      }
-    }
-    for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-      for (uint i = 0; i < TN; ++i) {
-        regN[wSubColIdx * TN + i] =
-            Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
-               threadColInWarp * TN + i];
-      }
-    }
-
-    // execute warptile matmul
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-      for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-        // calculate per-thread results
-        for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-          for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
-                          (wSubColIdx * TN) + resIdxN] +=
-                regM[wSubRowIdx * TM + resIdxM] *
-                regN[wSubColIdx * TN + resIdxN];
-          }
-        }
-      }
-    }
-  }
-}
-
-} // namespace wt
-
-
 /*
  * @tparam BM The threadblock size for M dimension SMEM caching.
  * @tparam BN The threadblock size for N dimension SMEM caching.
@@ -100,7 +22,7 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-    sgemmWarptiling_mine(int M, int N, int K, float alpha, float *A, float *B,
+    sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                     float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
@@ -323,64 +245,47 @@ __global__ void __launch_bounds__(NUM_THREADS)
   }
 }
 
-void runSgemmWarptiling_mine(int M, int N, int K, float alpha, float *A, float *B,
+void run_sgemm_warptiling(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
-  const int WARPSIZE = 32;
-  // Settings for A100
-  const uint K10_NUM_THREADS = 128;
-  const uint K10_BN = 128;
-  const uint K10_BM = 64;
-  const uint K10_BK = 16;
-  const uint K10_WN = 64;
-  const uint K10_WM = 32;
-  const uint K10_WNITER = 1;
-  const uint K10_TN = 4;
-  const uint K10_TM = 4;
-  // Settings for A6000
-  // const uint K10_NUM_THREADS = 128;
-  // const uint K10_BN = 128;
-  // const uint K10_BM = 128;
-  // const uint K10_BK = 16;
-  // const uint K10_WN = 64;
-  // const uint K10_WM = 64;
-  // const uint K10_WNITER = 4;
-  // const uint K10_TN = 4;
-  // const uint K10_TM = 8;
-  dim3 blockDim(K10_NUM_THREADS);
+  constexpr int WARPSIZE = 32;
+  const uint NUM_THREADS = 128;
+  const uint BN = 128;
+  const uint BM = 64;
+  const uint BK = 16;
+  const uint WN = 64;
+  const uint WM = 32;
+  const uint WNITER = 1;
+  const uint TN = 4;
+  const uint TM = 4;
+  constexpr uint NUM_WARPS = NUM_THREADS / WARPSIZE;
+  constexpr uint WMITER =
+      (WM * WN) / (WARPSIZE * TM * TN * WNITER);
 
-  constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
-
-  // warptile in threadblocktile
-  static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
-  static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
+  // warptile in blocktile
+  static_assert((BN % WN == 0) && (BM % WM == 0), "blockTile dim shoule be divisible by warpTile dim");
+  static_assert((BN / WN) * (BM / WM) == NUM_WARPS, "BN*BM/(WN*WM) should be NUM_WARPS");
 
   // threads in warpsubtile
-  static_assert((K10_WM * K10_WN) % (WARPSIZE * K10_TM * K10_TN * K10_WNITER) ==
-                0);
-  constexpr uint K10_WMITER =
-      (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
+  static_assert((WM * WN) % (WARPSIZE * TM * TN * WNITER) == 0, 
+    "WMITER should be integer");
   // warpsubtile in warptile
-  static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+  static_assert((WM % WMITER == 0) and (WN % WNITER == 0), 
+    "WM/WMITER means number of iterations of M each thread should go");
 
-  static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
-                "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of Bs during each iteraion)");
-  static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
-                "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of As during each iteration)");
-  static_assert(K10_BN % (16 * K10_TN) == 0,
+  static_assert((NUM_THREADS*4) % BK == 0 && (NUM_THREADS*4) % BN == 0, 
+      "number of items to load to be divisible by blockTile col dim");
+  static_assert(BN % (16 * TN) == 0,
                 "BN must be a multiple of 16*TN to avoid quantization effects");
-  static_assert(K10_BM % (16 * K10_TM) == 0,
+  static_assert(BM % (16 * TM) == 0,
                 "BM must be a multiple of 16*TM to avoid quantization effects");
-  static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                "BM*BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                "BN*BK must be a multiple of 4*256 to vectorize loads");
-
-  dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
-  sgemmWarptiling_mine<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                  K10_TN, K10_NUM_THREADS>
+  static_assert((BM * BK) % (4 * NUM_THREADS) == 0,
+                "BM*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
+  static_assert((BN * BK) % (4 * NUM_THREADS) == 0,
+                "BN*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
+  
+  dim3 blockDim(NUM_THREADS);
+  dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+  sgemmWarptiling<BM, BN, BK, WM, WN, WNITER, TM,
+                  TN, NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }

@@ -6,64 +6,72 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-template <const int BLOCKSIZE>
+template <const int BM, const int BN, const int BK, const uint threadsPerBlock=BM*BN>
 __global__ void sgemm_shared_mem_block(int M, int N, int K, float alpha,
                                        const float *A, const float *B,
                                        float beta, float *C) {
   // the output block that we want to compute in this threadblock
-  const uint cRow = blockIdx.x;
-  const uint cCol = blockIdx.y;
+  const uint blockX = blockIdx.x;
+  const uint blockY = blockIdx.y;
 
   // allocate buffer for current block in fast shared mem
   // shared mem is shared between all threads in a block
-  __shared__ float As[BLOCKSIZE * BLOCKSIZE];
-  __shared__ float Bs[BLOCKSIZE * BLOCKSIZE];
+  __shared__ float As[BM][BK];
+  __shared__ float Bs[BK][BN];
 
   // the inner row & col that we're accessing in this thread
-  const uint threadCol = threadIdx.x % BLOCKSIZE;
-  const uint threadRow = threadIdx.x / BLOCKSIZE;
+  const uint threadY = threadIdx.x % BN;
+  const uint threadX = threadIdx.x / BN;
+
+  const uint innerRowA = threadIdx.x / BK;
+  const uint innerColA = threadIdx.x % BK;
+  const uint strideA = threadsPerBlock / BK;
+
+  const uint innerRowB = threadIdx.x / BN;
+  const uint innerColB = threadIdx.x % BN;
+  const uint strideB = threadsPerBlock / BN;
 
   // advance pointers to the starting positions
-  A += cRow * BLOCKSIZE * K;                    // row=cRow, col=0
-  B += cCol * BLOCKSIZE;                        // row=0, col=cCol
-  C += cRow * BLOCKSIZE * N + cCol * BLOCKSIZE; // row=cRow, col=cCol
+  A += blockX * BM * K;                     // row=cRow, col=0
+  B += blockY * BN;                         // row=0, col=cCol
+  C += blockX * BM * N + blockY * BN;       // row=cRow, col=cCol
 
   float tmp = 0.0;
-  for (int bkIdx = 0; bkIdx < K; bkIdx += BLOCKSIZE) {
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // Have each thread load one of the elements in A & B
     // Make the threadCol (=threadIdx.x) the consecutive index
     // to allow global memory access coalescing
-    As[threadRow * BLOCKSIZE + threadCol] = A[threadRow * K + threadCol];
-    Bs[threadRow * BLOCKSIZE + threadCol] = B[threadRow * N + threadCol];
+    for(int i = 0; i < BM; i += strideA) {
+      As[innerRowA + i][innerColA] = A[(innerRowA + i) * K + innerColA];
+    }
+    for(int i = 0; i < BK; i += strideB) {
+      Bs[innerRowB + i][innerColB] = B[(innerRowB + i) * N + innerColB];
+    }
 
     // block threads in this block until cache is fully populated
     __syncthreads();
-    A += BLOCKSIZE;
-    B += BLOCKSIZE * N;
+    A += BK;
+    B += BK * N;
 
     // execute the dotproduct on the currently cached block
-    for (int dotIdx = 0; dotIdx < BLOCKSIZE; ++dotIdx) {
-      tmp += As[threadRow * BLOCKSIZE + dotIdx] *
-             Bs[dotIdx * BLOCKSIZE + threadCol];
+    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+      tmp += As[threadX][dotIdx] * Bs[dotIdx][threadY];
     }
     // need to sync again at the end, to avoid faster threads
     // fetching the next block into the cache before slower threads are done
     __syncthreads();
   }
-  C[threadRow * N + threadCol] =
-      alpha * tmp + beta * C[threadRow * N + threadCol];
+  C[threadX * N + threadY] = alpha * tmp + beta * C[threadX * N + threadY];
 }
 
 void run_sgemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
                                 float *B, float beta, float *C) {
-  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
-  dim3 blockDim(32 * 32);
-  // L1 cache becomes useless, since we access GMEM only via SMEM, so we carve
-  // out all of L1 to SMEM. This doesn't currently make a difference, since
-  // occupancy is limited by reg and thread count, but it's good to do anyway.
-  cudaFuncSetAttribute(sgemm_shared_mem_block<32>,
-                       cudaFuncAttributePreferredSharedMemoryCarveout,
-                       cudaSharedmemCarveoutMaxShared);
-  sgemm_shared_mem_block<32>
-      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  static const int BM = 32, BN = 32, BK = 32;
+  dim3 dimGrid(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
+  dim3 dimBlock(BM*BN);
+  cudaFuncSetAttribute(sgemm_shared_mem_block<32, 32, 32>,
+                      cudaFuncAttributePreferredSharedMemoryCarveout,
+                      cudaSharedmemCarveoutMaxShared);
+  sgemm_shared_mem_block<BM, BN, BK> 
+    <<< dimGrid, dimBlock >>>(M, N, K, alpha, A, B, beta, C);
 }

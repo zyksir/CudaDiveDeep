@@ -3,26 +3,16 @@
 #include <sstream> // for ostringstream
 #include "lib/macros.cuh" 
 #include "kernels/sgemm_kun.cu"
-#include "kernels/sgemm_ziqi.cu"
 #include "gemm_test.hpp"
 #include "kernels/1_naive.cuh"
 #include "kernels/2_kernel_global_mem_coalesce.cuh"
 #include "kernels/3_kernel_shared_mem_blocking.cuh"
-#include "kernels/3_kernel_shared_mem_blocking_mine.cuh"
 #include "kernels/4_kernel_blocktiling.cuh"
-#include "kernels/4_kernel_blocktiling_mine.cuh"
-#include "kernels/6_kernel_vectorize.cuh"
-#include "kernels/6_kernel_vectorize_mine.cuh"
-#include "kernels/6_kernel_vectorize_better_load.cuh"
-#include "kernels/6_kernel_vectorize_double_buffering.cuh"
-#include "kernels/6_kernel_vectorize_double_buffering2.cuh"
-#include "kernels/7_kernel_resolve_bank_conflicts.cuh"
-#include "kernels/8_kernel_bank_extra_col.cuh"
-#include "kernels/9_kernel_autotuned.cuh"
-#include "kernels/10_kernel_warptiling.cuh"
-#include "kernels/10_kernel_warptiling_mine.cuh"
-#include "kernels/11_kernel_double_buffering.cuh"
-// #include "kernels/12_kernel_double_buffering.cuh"
+#include "kernels/5_kernel_vectorize.cuh"
+#include "kernels/6_kernel_double_buffering.cuh"
+#include "kernels/6_kernel_double_buffering2.cuh"
+#include "kernels/7_kernel_warptiling.cuh"
+#include "kernels/7_kernel_warptiling2.cuh"
 
 void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
@@ -35,9 +25,6 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // cuBLAS uses column-major order. So we change the order of our row-major A &
-  // B, since (B^T*A^T)^T = (A*B)
-  // This runs cuBLAS in full fp32 mode
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -45,8 +32,6 @@ void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -54,8 +39,6 @@ void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -63,11 +46,12 @@ void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 using triple = std::tuple<size_t, size_t, size_t>;
 int main() {
-  const uint num_repeats = 40;
+  const uint num_repeats = 10;
   std::vector<triple> problem_size = {
     triple(4096, 4096, 4096),
     triple(2048, 2048, 2048),
     triple(1024, 1024, 1024),
+    triple(512, 512, 512),
     triple(128, 4096, 1024)
   };
   CudaDeviceInfo();
@@ -89,7 +73,7 @@ int main() {
       cublasCreate(&handle);
       runCublasFP32(handle, M, N, K, 1.0, A, B, 0.0, C);
     }, "cublas_fp32");
-    // wrong result
+    // // wrong result
     // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
     //   static cublasHandle_t handle;
     //   cublasCreate(&handle);
@@ -100,10 +84,10 @@ int main() {
       cublasCreate(&handle);
       runCublasTF32(handle, M, N, K, 1.0, A, B, 0.0, C);
     }, "cublas_tf32");
-    // sgemm_test.run_cuda(run_kun, "kun");
+    sgemm_test.run_cuda(run_kun, "kun");
     sgemm_test.run_cuda(run_kun_v3, "kun_v3");
     // sgemm_test.run_cuda(run_ziqi, "ziqi"); // run result
-    // too slow
+    // // too slow
     // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
     //   run_sgemm_naive(M, N, K, 1.0, A, B, 0.0, C);
     // }, "v1_naive");
@@ -113,52 +97,24 @@ int main() {
     // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
     //   run_sgemm_shared_mem_block(M, N, K, 1.0, A, B, 0.0, C);
     // }, "v3_shared_mem");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   run_sgemm_shared_mem_block_mine(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v3_shared_mem_mine");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemm2DBlocktiling(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v4_block_tiling");
     sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-      runSgemm2DBlocktiling_mine(M, N, K, 1.0, A, B, 0.0, C);
-    }, "v4_block_tiling_mine");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmVectorize(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v6_vectorize");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmVectorize_mine(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v6_vectorize_mine");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmVectorize_better_load(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v6_vectorize_better_load");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmVectorize_double_buffering(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v6_vectorize_double_buffering");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmVectorize_double_buffering2(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v6_vectorize_double_buffering2");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmResolveBankConflicts(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v7_bank_conflict");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmResolveBankExtraCol(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v8_back_conflict_col");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmAutotuned(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v9_autotuned");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmWarptiling(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v10_warptiling");
+      run_sgemm_blocktiling(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v4_block_tiling");
     sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-      runSgemmWarptiling_mine(M, N, K, 1.0, A, B, 0.0, C);
-    }, "v10_warptiling_mine");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmDoubleBuffering(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v11_doublebuffering");
-    // sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
-    //   runSgemmDoubleBuffering2(M, N, K, 1.0, A, B, 0.0, C);
-    // }, "v12_doublebuffering2");
-
+      run_sgemm_vectorize(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v5_vectorize");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      run_sgemm_double_buffering(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v6_double_buffering");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      run_sgemm_double_buffering2(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v6_double_buffering2");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      run_sgemm_warptiling(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v7_warptiling");
+    sgemm_test.run_cuda([](float* A, float* B, float* C, size_t M, size_t N, size_t K){
+      run_sgemm_warptiling2(M, N, K, 1.0, A, B, 0.0, C);
+    }, "v7_warptilin2");
   }
   return 0;
 }

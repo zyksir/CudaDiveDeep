@@ -34,7 +34,7 @@ template <
     const int THREAD_SIZE_X,  // width of block of C that each thread calculate
     const bool ENABLE_DOUBLE_BUFFER // whether enable double buffering or not
     > 
-__global__ void Sgemm( 
+__global__ void Sgemm_kun( 
     float * __restrict__ A,
     float * __restrict__ B,
     float * __restrict__ C, 
@@ -76,15 +76,15 @@ __global__ void Sgemm(
     const int B_TILE_THREAD_PER_ROW = BLOCK_SIZE_N / 4;
 
     // row number and col number that needs to be loaded by this thread
-    const int A_TILE_ROW_START = tid / A_TILE_THREAD_PER_ROW;
-    const int B_TILE_ROW_START = tid / B_TILE_THREAD_PER_ROW;
+    const int innerRowA = tid / A_TILE_THREAD_PER_ROW;
+    const int innerRowB = tid / B_TILE_THREAD_PER_ROW;
 
-    const int A_TILE_COL = tid % A_TILE_THREAD_PER_ROW * 4; 
-    const int B_TILE_COL = tid % B_TILE_THREAD_PER_ROW * 4;
+    const int innerColA = tid % A_TILE_THREAD_PER_ROW * 4; 
+    const int innerColB = tid % B_TILE_THREAD_PER_ROW * 4;
 
     // row stride that thread uses to load multiple rows of a tile
-    const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
-    const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+    const int rowStrideA = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
+    const int rowStrideB = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
     A = &A[(BLOCK_SIZE_M * by)* K];
     B = &B[BLOCK_SIZE_N * bx];
@@ -92,23 +92,23 @@ __global__ void Sgemm(
     //transfer first tile from global mem to shared mem
     // load A from global memory to shared memory
     #pragma unroll
-    for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-        int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+    for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+        int ldg_index = i / rowStrideA * 4;
         FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
-            A_TILE_ROW_START + i, // row
-            A_TILE_COL, // col
+            innerRowA + i, // row
+            innerColA, // col
             K )]);
-        As[0][A_TILE_COL][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index];
-        As[0][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+1];
-        As[0][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
-        As[0][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
+        As[0][innerColA][innerRowA + i]=ldg_a_reg[ldg_index];
+        As[0][innerColA+1][innerRowA + i]=ldg_a_reg[ldg_index+1];
+        As[0][innerColA+2][innerRowA + i]=ldg_a_reg[ldg_index+2];
+        As[0][innerColA+3][innerRowA + i]=ldg_a_reg[ldg_index+3];
     }
     // load B from global memory to shared memory
     #pragma unroll
-    for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-        FETCH_FLOAT4(Bs[0][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(B[OFFSET(
-                B_TILE_ROW_START + i, // row
-                B_TILE_COL, // col
+    for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+        FETCH_FLOAT4(Bs[0][innerRowB + i][innerColB]) = FETCH_FLOAT4(B[OFFSET(
+                innerRowB + i, // row
+                innerColB, // col
                 N )]);
     }
     __syncthreads();
@@ -130,19 +130,19 @@ __global__ void Sgemm(
         // load next tile from global mem
         if(tile_idx< K){
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+                int ldg_index = i / rowStrideA * 4;
                 FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
-                    A_TILE_ROW_START + i, // row
-                    A_TILE_COL + tile_idx, // col
+                    innerRowA + i, // row
+                    innerColA + tile_idx, // col
                     K )]);
             }
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
+            for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+                int ldg_index = i / rowStrideB * 4;
                 FETCH_FLOAT4(ldg_b_reg[ldg_index]) = FETCH_FLOAT4(B[OFFSET(
-                    tile_idx + B_TILE_ROW_START + i, // row
-                    B_TILE_COL, // col
+                    tile_idx + innerRowB + i, // row
+                    innerColB, // col
                     N )]);
             }
         }
@@ -174,18 +174,18 @@ __global__ void Sgemm(
 
         if(tile_idx < K){
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-                As[write_stage_idx][A_TILE_COL][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index];
-                As[write_stage_idx][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+1];
-                As[write_stage_idx][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
-                As[write_stage_idx][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
+            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+                int ldg_index = i / rowStrideA * 4;
+                As[write_stage_idx][innerColA][innerRowA + i]=ldg_a_reg[ldg_index];
+                As[write_stage_idx][innerColA+1][innerRowA + i]=ldg_a_reg[ldg_index+1];
+                As[write_stage_idx][innerColA+2][innerRowA + i]=ldg_a_reg[ldg_index+2];
+                As[write_stage_idx][innerColA+3][innerRowA + i]=ldg_a_reg[ldg_index+3];
             }
             // load B from global memory to shared memory
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-                FETCH_FLOAT4(Bs[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(ldg_b_reg[ldg_index]);
+            for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+                int ldg_index = i / rowStrideB * 4;
+                FETCH_FLOAT4(Bs[write_stage_idx][innerRowB + i][innerColB]) = FETCH_FLOAT4(ldg_b_reg[ldg_index]);
             }
             // use double buffer, only need one sync
             __syncthreads();
@@ -251,7 +251,7 @@ void run_kun(float* gpu_A, float* gpu_B, float* gpu_C, size_t M, size_t N, size_
 
     dim3 dimBlock(BLOCK_SIZE_N / THREAD_SIZE_X, BLOCK_SIZE_M / THREAD_SIZE_Y);
     dim3 dimGrid(N / BLOCK_SIZE_N, M / BLOCK_SIZE_M);
-    Sgemm<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
+    Sgemm_kun<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
     <<< dimGrid, dimBlock >>>(gpu_A, gpu_B, gpu_C, M, N, K);
 }
 
@@ -263,7 +263,7 @@ template <
     const int THREAD_SIZE_X,  // width of block of C that each thread calculate
     const bool ENABLE_DOUBLE_BUFFER // whether enable double buffering or not
     > 
-__global__ void Sgemm_v3( 
+__global__ void Sgemm_kun_v3( 
     float * __restrict__ A,
     float * __restrict__ B,
     float * __restrict__ C, 
@@ -312,15 +312,15 @@ __global__ void Sgemm_v3(
     const int B_TILE_THREAD_PER_ROW = BLOCK_SIZE_N / 4;
 
     // row number and col number that needs to be loaded by this thread
-    const int A_TILE_ROW_START = tid / A_TILE_THREAD_PER_ROW;
-    const int B_TILE_ROW_START = tid / B_TILE_THREAD_PER_ROW;
+    const int innerRowA = tid / A_TILE_THREAD_PER_ROW;
+    const int innerRowB = tid / B_TILE_THREAD_PER_ROW;
 
-    const int A_TILE_COL = tid % A_TILE_THREAD_PER_ROW * 4; 
-    const int B_TILE_COL = tid % B_TILE_THREAD_PER_ROW * 4;
+    const int innerColA = tid % A_TILE_THREAD_PER_ROW * 4; 
+    const int innerColB = tid % B_TILE_THREAD_PER_ROW * 4;
 
     // row stride that thread uses to load multiple rows of a tile
-    const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
-    const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+    const int rowStrideA = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
+    const int rowStrideB = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
     A = &A[(BLOCK_SIZE_M * by)* K];
     B = &B[BLOCK_SIZE_N * bx];
@@ -334,23 +334,23 @@ __global__ void Sgemm_v3(
     //transfer first tile from global mem to shared mem
     // load A from global memory to shared memory
     #pragma unroll
-    for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-        int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+    for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+        int ldg_index = i / rowStrideA * 4;
         FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
-            A_TILE_ROW_START + i, // row
-            A_TILE_COL, // col
+            innerRowA + i, // row
+            innerColA, // col
             K )]);
-        As[0][A_TILE_COL][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index];
-        As[0][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+1];
-        As[0][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
-        As[0][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
+        As[0][innerColA][innerRowA + i]=ldg_a_reg[ldg_index];
+        As[0][innerColA+1][innerRowA + i]=ldg_a_reg[ldg_index+1];
+        As[0][innerColA+2][innerRowA + i]=ldg_a_reg[ldg_index+2];
+        As[0][innerColA+3][innerRowA + i]=ldg_a_reg[ldg_index+3];
     }
     // load B from global memory to shared memory
     #pragma unroll
-    for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-        FETCH_FLOAT4(Bs[0][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(B[OFFSET(
-                B_TILE_ROW_START + i, // row
-                B_TILE_COL, // col
+    for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+        FETCH_FLOAT4(Bs[0][innerRowB + i][innerColB]) = FETCH_FLOAT4(B[OFFSET(
+                innerRowB + i, // row
+                innerColB, // col
                 N )]);
     }
     __syncthreads();
@@ -371,19 +371,19 @@ __global__ void Sgemm_v3(
         // load next tile from global mem
         if(tile_idx< K){
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+                int ldg_index = i / rowStrideA * 4;
                 FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
-                    A_TILE_ROW_START + i, // row
-                    A_TILE_COL + tile_idx, // col
+                    innerRowA + i, // row
+                    innerColA + tile_idx, // col
                     K )]);
             }
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
+            for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+                int ldg_index = i / rowStrideB * 4;
                 FETCH_FLOAT4(ldg_b_reg[ldg_index]) = FETCH_FLOAT4(B[OFFSET(
-                    tile_idx + B_TILE_ROW_START + i, // row
-                    B_TILE_COL, // col
+                    tile_idx + innerRowB + i, // row
+                    innerColB, // col
                     N )]);
             }
         }
@@ -412,18 +412,18 @@ __global__ void Sgemm_v3(
         if(tile_idx < K){
             // load A from global memory to shared memory
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
-                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-                As[write_stage_idx][A_TILE_COL][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index];
-                As[write_stage_idx][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+1];
-                As[write_stage_idx][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
-                As[write_stage_idx][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
+            for ( int i = 0 ; i < BLOCK_SIZE_M ; i += rowStrideA) {
+                int ldg_index = i / rowStrideA * 4;
+                As[write_stage_idx][innerColA][innerRowA + i]=ldg_a_reg[ldg_index];
+                As[write_stage_idx][innerColA+1][innerRowA + i]=ldg_a_reg[ldg_index+1];
+                As[write_stage_idx][innerColA+2][innerRowA + i]=ldg_a_reg[ldg_index+2];
+                As[write_stage_idx][innerColA+3][innerRowA + i]=ldg_a_reg[ldg_index+3];
             }
             // load B from global memory to shared memory
             #pragma unroll
-            for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
-                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-                FETCH_FLOAT4(Bs[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(ldg_b_reg[ldg_index]);
+            for ( int i = 0 ; i < BLOCK_SIZE_K; i += rowStrideB) {
+                int ldg_index = i / rowStrideB * 4;
+                FETCH_FLOAT4(Bs[write_stage_idx][innerRowB + i][innerColB]) = FETCH_FLOAT4(ldg_b_reg[ldg_index]);
             }
             // use double buffer, only need one sync
             __syncthreads();
@@ -491,6 +491,6 @@ void run_kun_v3(float* gpu_A, float* gpu_B, float* gpu_C, size_t M, size_t N, si
 
     dim3 dimBlock(BLOCK_SIZE_N / THREAD_SIZE_X, BLOCK_SIZE_M / THREAD_SIZE_Y);
     dim3 dimGrid(N / BLOCK_SIZE_N, M / BLOCK_SIZE_M);
-    Sgemm_v3<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
+    Sgemm_kun_v3<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
     <<< dimGrid, dimBlock >>>(gpu_A, gpu_B, gpu_C, M, N, K);
 }

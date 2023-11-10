@@ -80,7 +80,6 @@ public:
 			cuda_func(gpu_A, gpu_B, gpu_C, M, N, K);
 		}
 		float elapsed_ms = cuda_event_stop();
-		std::chrono::nanoseconds gpu_duration((uint64_t)(elapsed_ms * 1e6));
-		print_performance_result(gpu_duration, kernel_name);
+		print_performance_result(elapsed_ms, kernel_name);
     }
 };

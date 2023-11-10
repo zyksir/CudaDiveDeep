@@ -6,15 +6,12 @@
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-
-#define OFFSET(row, col, ld) ((row) * (ld) + (col))
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "../lib/macros.cuh" 
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN, 
     const int TX=BM/TM, const int TY=BN/TN, const int THREAD_NUM_PER_BLOCK=TX*TY>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
-    sgemmVectorize_better_load(int M, int N, int K, float alpha, float *A,
+    sgemmVectorize(int M, int N, int K, float alpha, float *A,
                       float *B, float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
@@ -40,12 +37,12 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // const float lgd_B_reg[4*ldg_num_B];
   const int A_TILE_THREAD_PER_ROW = BK / 4;
   const int B_TILE_THREAD_PER_ROW = BN / 4;
-  const int A_TILE_ROW_START = tid / A_TILE_THREAD_PER_ROW;
-  const int B_TILE_ROW_START = tid / B_TILE_THREAD_PER_ROW;
-  const int A_TILE_COL = tid % A_TILE_THREAD_PER_ROW * 4; 
-  const int B_TILE_COL = tid % B_TILE_THREAD_PER_ROW * 4;
-  const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
-  const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+  const int innerRowA = tid / A_TILE_THREAD_PER_ROW;
+  const int innerRowB = tid / B_TILE_THREAD_PER_ROW;
+  const int innerColA = tid % A_TILE_THREAD_PER_ROW * 4; 
+  const int innerColB = tid % B_TILE_THREAD_PER_ROW * 4;
+  const int rowStrideA = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
+  const int rowStrideB = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
   // allocate thread-local cache for results in registerfile
   float threadResults[TM][TN] = {0.0};
@@ -57,24 +54,20 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // load a block of size BM x BK from A to As
     #pragma unroll
-    for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
-      int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-        FETCH_FLOAT4(ldg_A_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
-            A_TILE_ROW_START + i, // row
-            A_TILE_COL, // col
-            K )]);
-        As[A_TILE_COL][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index];
-        As[A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+1];
-        As[A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+2];
-        As[A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_A_reg[ldg_index+3];
+    for(int i = 0; i < BM; i+=rowStrideA) {
+      int ldg_index = i / rowStrideA * 4;
+        FLOAT4(ldg_A_reg[ldg_index]) = 
+          FLOAT4(Val(A, innerRowA + i, innerColA, K ));
+        As[innerColA][innerRowA + i]=ldg_A_reg[ldg_index];
+        As[innerColA+1][innerRowA + i]=ldg_A_reg[ldg_index+1];
+        As[innerColA+2][innerRowA + i]=ldg_A_reg[ldg_index+2];
+        As[innerColA+3][innerRowA + i]=ldg_A_reg[ldg_index+3];
     }
 
     #pragma unroll
-    for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
-      FETCH_FLOAT4(Bs[B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(B[OFFSET(
-                B_TILE_ROW_START + i, // row
-                B_TILE_COL, // col
-                N )]);
+    for(int i = 0; i < BK; i+=rowStrideB) {
+      FLOAT4(Bs[innerRowB + i][innerColB]) = 
+        FLOAT4(Val(B, innerRowB + i, innerColB, N ));
     }
     __syncthreads();
 
@@ -88,11 +81,11 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
       // block into registers
       #pragma unroll
       for (uint i = 0; i < TM; i+=4) {
-        FETCH_FLOAT4(regA[i]) = FETCH_FLOAT4(As[dotIdx][threadRow * TM + i]);
+        FLOAT4(regA[i]) = FLOAT4(As[dotIdx][threadRow * TM + i]);
       }
       #pragma unroll
       for (uint i = 0; i < TN; i+=4) {
-        FETCH_FLOAT4(regB[i]) = FETCH_FLOAT4(Bs[dotIdx][threadCol * TN + i]);
+        FLOAT4(regB[i]) = FLOAT4(Bs[dotIdx][threadCol * TN + i]);
       }
       #pragma unroll
       for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
@@ -109,19 +102,19 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // write out the results
   for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
     for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
-      float4 tmp = FETCH_FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]);
+      float4 tmp = FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]);
       // perform GEMM update in reg
       tmp.x = alpha * threadResults[resIdxM][resIdxN] + beta * tmp.x;
       tmp.y = alpha * threadResults[resIdxM][resIdxN + 1] + beta * tmp.y;
       tmp.z = alpha * threadResults[resIdxM][resIdxN + 2] + beta * tmp.z;
       tmp.w = alpha * threadResults[resIdxM][resIdxN + 3] + beta * tmp.w;
       // write back
-      FETCH_FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]) = tmp;
+      FLOAT4(C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN]) = tmp;
     }
   }
 }
 
-void runSgemmVectorize_better_load(int M, int N, int K, float alpha, float *A, float *B,
+void run_sgemm_vectorize(int M, int N, int K, float alpha, float *A, float *B,
                        float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -129,9 +122,20 @@ void runSgemmVectorize_better_load(int M, int N, int K, float alpha, float *A, f
   if (M >= 128 and N >= 128) {
     const uint BM = 128;
     const uint BN = 128;
+    const uint NUM_THREADS = (BM * BN) / (TM * TN);
+
+    static_assert((BM % TM == 0) && (BN % TN == 0), 
+      "blockTile dim should be divisible by threadTile dim");
+    static_assert((NUM_THREADS*4) % BK == 0 && (NUM_THREADS*4) % BN == 0, 
+      "number of items to load to be divisible by blockTile col dim");
+    static_assert((BM * BK) % (4 * NUM_THREADS) == 0,
+                "BM*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
+    static_assert((BN * BK) % (4 * NUM_THREADS) == 0,
+                "BN*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
+    
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize_better_load<BM, BN, BK, TM, TN>
+    sgemmVectorize<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -140,7 +144,7 @@ void runSgemmVectorize_better_load(int M, int N, int K, float alpha, float *A, f
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize_better_load<BM, BN, BK, TM, TN>
+    sgemmVectorize<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }

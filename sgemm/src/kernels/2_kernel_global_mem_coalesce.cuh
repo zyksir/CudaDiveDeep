@@ -25,8 +25,9 @@ __global__ void sgemm_global_mem_coalesce(int M, int N, int K, float alpha,
 
 void run_sgemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
-  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
-  dim3 blockDim(32 * 32);
-  sgemm_global_mem_coalesce<32>
+  const int BLOCKSIZE = 32;
+  dim3 gridDim(CEIL_DIV(M, BLOCKSIZE), CEIL_DIV(N, BLOCKSIZE));
+  dim3 blockDim(BLOCKSIZE * BLOCKSIZE);
+  sgemm_global_mem_coalesce<BLOCKSIZE>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }

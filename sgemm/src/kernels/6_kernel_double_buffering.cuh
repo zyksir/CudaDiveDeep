@@ -11,7 +11,7 @@
 template <const int BM, const int BN, const int BK, const int TM, const int TN, 
     const int TX=BM/TM, const int TY=BN/TN, const int THREAD_NUM_PER_BLOCK=TX*TY>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
-    sgemmVectorize_double_buffering2(int M, int N, int K, float alpha, float *A,
+    sgemmVectorize_double_buffering(int M, int N, int K, float alpha, float *A,
                       float *B, float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
@@ -40,12 +40,12 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   float ldg_B_reg[4*ldg_num_B];
   const int A_TILE_THREAD_PER_ROW = BK / 4;
   const int B_TILE_THREAD_PER_ROW = BN / 4;
-  const int A_TILE_ROW_START = tid / A_TILE_THREAD_PER_ROW;
-  const int B_TILE_ROW_START = tid / B_TILE_THREAD_PER_ROW;
-  const int A_TILE_COL = tid % A_TILE_THREAD_PER_ROW * 4; 
-  const int B_TILE_COL = tid % B_TILE_THREAD_PER_ROW * 4;
-  const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
-  const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+  const int innerRowA = tid / A_TILE_THREAD_PER_ROW;
+  const int innerRowB = tid / B_TILE_THREAD_PER_ROW;
+  const int innerColA = tid % A_TILE_THREAD_PER_ROW * 4; 
+  const int innerColB = tid % B_TILE_THREAD_PER_ROW * 4;
+  const int rowStrideA = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
+  const int rowStrideB = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
   // allocate thread-local cache for results in registerfile
   float threadResults[TM*TN] = {0.0};
@@ -56,19 +56,19 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   // Step0. Preload
   // Stage0.1: Load Block from global memory to register and from register to shared memory
   #pragma unroll
-  for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
-    int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+  for(int i = 0; i < BM; i+=rowStrideA) {
+    int ldg_index = i / rowStrideA * 4;
       FLOAT4(ldg_A_reg[ldg_index]) = 
-        FLOAT4(Val(A, A_TILE_ROW_START + i, A_TILE_COL, K ));
-      Val3D(As, 0, A_TILE_COL, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index];
-      Val3D(As, 0, A_TILE_COL+1, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+1];
-      Val3D(As, 0, A_TILE_COL+2, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+2];
-      Val3D(As, 0, A_TILE_COL+3, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+3];
+        FLOAT4(Val(A, innerRowA + i, innerColA, K ));
+      Val3D(As, 0, innerColA, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index];
+      Val3D(As, 0, innerColA+1, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+1];
+      Val3D(As, 0, innerColA+2, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+2];
+      Val3D(As, 0, innerColA+3, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+3];
   }
   #pragma unroll
-  for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
-    FLOAT4(Val3D(Bs, 0, B_TILE_ROW_START + i, B_TILE_COL, BK, BN)) = 
-      FLOAT4(Val(B, B_TILE_ROW_START + i, B_TILE_COL, N));
+  for(int i = 0; i < BK; i+=rowStrideB) {
+    FLOAT4(Val3D(Bs, 0, innerRowB + i, innerColB, BK, BN)) = 
+      FLOAT4(Val(B, innerRowB + i, innerColB, N));
   }
   __syncthreads();
   // Stage0.2: Load Tile from shared memory to register
@@ -85,16 +85,16 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     tile_idx += BK;
     if (tile_idx < K) {
       #pragma unroll
-      for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
-        int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+      for(int i = 0; i < BM; i+=rowStrideA) {
+        int ldg_index = i / rowStrideA * 4;
         FLOAT4(ldg_A_reg[ldg_index]) = 
-          FLOAT4(Val(A, A_TILE_ROW_START + i, A_TILE_COL + tile_idx, K));
+          FLOAT4(Val(A, innerRowA + i, innerColA + tile_idx, K));
       }
       #pragma unroll
-      for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
-        int ldg_index = i / B_TILE_ROW_STRIDE * 4;
+      for(int i = 0; i < BK; i+=rowStrideB) {
+        int ldg_index = i / rowStrideB * 4;
         FLOAT4(ldg_B_reg[ldg_index]) = 
-          FLOAT4(Val(B, tile_idx + B_TILE_ROW_START + i, B_TILE_COL, N));
+          FLOAT4(Val(B, tile_idx + innerRowB + i, innerColB, N));
       }
     }
     int load_stage_idx = write_stage_idx ^ 1;
@@ -123,17 +123,17 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
 
     if(tile_idx < K){
       #pragma unroll
-      for(int i = 0; i < BM; i+=A_TILE_ROW_STRIDE) {
-        int ldg_index = i / A_TILE_ROW_STRIDE * 4;
-        Val3D(As, write_stage_idx, A_TILE_COL, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index];
-        Val3D(As, write_stage_idx, A_TILE_COL+1, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+1];
-        Val3D(As, write_stage_idx, A_TILE_COL+2, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+2];
-        Val3D(As, write_stage_idx, A_TILE_COL+3, A_TILE_ROW_START + i, BK, BM) = ldg_A_reg[ldg_index+3];
+      for(int i = 0; i < BM; i+=rowStrideA) {
+        int ldg_index = i / rowStrideA * 4;
+        Val3D(As, write_stage_idx, innerColA, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index];
+        Val3D(As, write_stage_idx, innerColA+1, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+1];
+        Val3D(As, write_stage_idx, innerColA+2, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+2];
+        Val3D(As, write_stage_idx, innerColA+3, innerRowA + i, BK, BM) = ldg_A_reg[ldg_index+3];
       }
       #pragma unroll
-      for(int i = 0; i < BK; i+=B_TILE_ROW_STRIDE) {
-        int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-        FLOAT4(Val3D(Bs, write_stage_idx, B_TILE_ROW_START + i, B_TILE_COL, BK, BN)) = 
+      for(int i = 0; i < BK; i+=rowStrideB) {
+        int ldg_index = i / rowStrideB * 4;
+        FLOAT4(Val3D(Bs, write_stage_idx, innerRowB + i, innerColB, BK, BN)) = 
           FLOAT4(ldg_B_reg[ldg_index]);
       }
       __syncthreads();
@@ -175,7 +175,7 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   }
 }
 
-void runSgemmVectorize_double_buffering2(int M, int N, int K, float alpha, float *A, float *B,
+void run_sgemm_double_buffering(int M, int N, int K, float alpha, float *A, float *B,
                        float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -183,9 +183,16 @@ void runSgemmVectorize_double_buffering2(int M, int N, int K, float alpha, float
   if (M >= 128 and N >= 128) {
     const uint BM = 128;
     const uint BN = 128;
+    const uint NUM_THREADS = (BM * BN) / (TM * TN);
+    
+    static_assert((BM % TM == 0) && (BN % TN == 0), 
+      "blockTile dim should be divisible by threadTile dim");
+    static_assert((NUM_THREADS*4) % BK == 0 && (NUM_THREADS*4) % BN == 0, 
+      "number of items to load to be divisible by blockTile col dim");
+
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BN*BM)/(TN*TM));
-    sgemmVectorize_double_buffering2<BM, BN, BK, TM, TN>
+    sgemmVectorize_double_buffering<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -194,7 +201,7 @@ void runSgemmVectorize_double_buffering2(int M, int N, int K, float alpha, float
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize_double_buffering2<BM, BN, BK, TM, TN>
+    sgemmVectorize_double_buffering<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }
