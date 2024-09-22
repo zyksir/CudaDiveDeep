@@ -1,0 +1,1 @@
+For Report of Reduce, see this blog: https://zyksir.github.io/2024/09/22/cuda-mode-1-lec9-reduction/
