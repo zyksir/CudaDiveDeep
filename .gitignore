@@ -1,5 +1,5 @@
 *.egg-info/
 *build/
-*reduce_extension/*
+*reduce_extension*
 *__pycache__*
 dist/
