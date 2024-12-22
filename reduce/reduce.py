@@ -9,6 +9,9 @@ from torch.utils.cpp_extension import load_inline
 
 cuda_source = '''
 #include <iostream>
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
 #define checkCudaErrors(val) check( (val), #val, __FILE__, __LINE__)
 template<typename T>
@@ -37,8 +40,8 @@ __global__ void reduce7(float *g_idata, float *g_odata, int n) {
     unsigned int tid = threadIdx.x;
     unsigned int i = blockIdx.x*(blockSize*2) + tid;
     unsigned int gridSize = blockSize*2*gridDim.x;
-    sdata[tid] = g_idata[i] + g_idata[i+blockSize]; i+= gridSize;
-    while (i < n) { sdata[tid] += g_idata[i] + g_idata[i+blockSize]; i += gridSize; }
+    sdata[tid] = ((i < n) ? g_idata[i] : 0) + ((i+blockDim.x < n) ? g_idata[i+blockDim.x] : 0); i+= gridSize;
+    while (i < n) { sdata[tid] += ((i < n) ? g_idata[i] : 0) + ((i+blockDim.x < n) ? g_idata[i+blockDim.x] : 0); i += gridSize; }
     __syncthreads();
     if (blockSize >= 1024) { if (tid < 512) { sdata[tid] += sdata[tid + 512]; } __syncthreads(); }
     if (blockSize >= 512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
@@ -61,6 +64,7 @@ float gpu_sum_reduce(float* d_in, unsigned int d_in_len, decltype(reduce7) kerne
 	// our block_sum_reduce()
 	unsigned int max_elems_per_block = block_sz * coarse_factor; // due to binary tree nature of algorithm	
 	unsigned int grid_sz = (d_in_len + max_elems_per_block - 1) / max_elems_per_block / unroll_factor;
+    grid_sz = grid_sz == 0 ? 1 : grid_sz;
     // std::cout << max_elems_per_block << "," << grid_sz << std::endl;
 
 	// Allocate memory for array of total sums produced by each block
@@ -119,7 +123,7 @@ def compiled_sum(matrix):
 
 
 if __name__ == "__main__":
-    size = int(1e9)
+    size = int(1e4)
     input_ = torch.randn(size).cuda()
     
     s = time.perf_counter()
@@ -143,7 +147,7 @@ if __name__ == "__main__":
     s = time.perf_counter()
     my_sum = reduce_extension.reduce(input_)
     torch.cuda.synchronize()
-    for _ in range(100):
+    for _ in range(0):
         my_sum = reduce_extension.reduce(input_)
     torch.cuda.synchronize()
     e = time.perf_counter()

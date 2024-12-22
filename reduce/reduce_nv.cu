@@ -197,7 +197,7 @@ __global__ void reduce7(int *g_idata, int *g_odata, int n) {
     unsigned int tid = threadIdx.x;
     unsigned int i = blockIdx.x*(blockSize*2) + tid;
     unsigned int gridSize = blockSize*2*gridDim.x;
-    sdata[tid] = g_idata[i] + g_idata[i+blockSize]; i+= gridSize;
+    sdata[tid] = ((i < n) ? g_idata[i] : 0) + ((i+blockDim.x < n) ? g_idata[i+blockDim.x] : 0); i+= gridSize;
     while (i < n) { sdata[tid] += g_idata[i] + g_idata[i+blockSize]; i += gridSize; }
     __syncthreads();
     if (blockSize >= 1024) { if (tid < 512) { sdata[tid] += sdata[tid + 512]; } __syncthreads(); }
@@ -282,7 +282,7 @@ int main() {
 	std::clock_t start;
 	double duration;
 
-	for (int k = 27; k < 28; ++k) {
+	for (int k = 10; k < 28; ++k) {
 		unsigned int h_in_len = (1 << k);
 		std::cout << "h_in_len: " << h_in_len << std::endl;
 		int* h_in = new int[h_in_len];
