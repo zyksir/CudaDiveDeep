@@ -12,7 +12,7 @@ my_module = load_inline(
     cpp_sources=[cpp_source],
     functions=['hello_world'],
     verbose=True,
-    build_directory='./tmp'
+    build_directory='local_cuda'
 )
 
 print(my_module.hello_world())

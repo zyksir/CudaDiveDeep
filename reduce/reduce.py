@@ -113,7 +113,7 @@ reduce_extension = load_inline(
     functions=['reduce'],
     with_cuda=True,
     extra_cuda_cflags=["-O2"],
-    build_directory='./reduce_extension',
+    build_directory='./local_cuda',
 )
 
 @torch.compile
