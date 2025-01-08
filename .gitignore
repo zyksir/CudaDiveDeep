@@ -1,5 +1,5 @@
 *.egg-info/
 *build/
-*local_cuda*
+*reduce_extension*
 *__pycache__*
 dist/

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 
 #include <ATen/ATen.h>
@@ -16,4 +18,9 @@ void check(T err, const char* const func, const char* const file, const int line
     std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
     exit(1);
   }
+}
+
+template <typename T>
+inline T *get_ptr(torch::Tensor &t) {
+    return reinterpret_cast<T *>(t.data_ptr());
 }

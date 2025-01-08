@@ -17,6 +17,8 @@ cxx_src_files = []
 
 nvcc_src_files = [
     "csrc/reduce/reduce.cu",
+    "csrc/permute/permute.cu",
+    "csrc/permute/permute_lisan.cu",
 ]
 
 csrc_dir = str(current_path / "csrc")
