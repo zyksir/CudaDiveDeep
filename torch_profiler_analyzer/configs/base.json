@@ -1,0 +1,48 @@
+{
+    "IGNORE_GPU_ANNOTATION": ".*(ProfilerStep)|(FullyShardedDataParallel)|(nccl:).*",
+    "RULE_TYPE": "gpu_annotation",
+    "RULES": [
+      {
+        "PREFIX": null,
+        "PATTERN": null,
+        "SUB_RULES": {
+          "RULE_TYPE": "kernel_name",
+          "PRIORITY": [],
+          "RULES": [
+            {
+              "PREFIX": "gemm",
+              "PATTERN": ".*nvjet_.*"
+            },
+            {
+              "PREFIX": "attention",
+              "PATTERN": ".*(cutlass_kernel_flash_attncuteflash|FlashAttnFwdSm90).*"
+            },
+            {
+              "PREFIX": "copy",
+              "PATTERN": ".*(bfloat16_copy_kernel_cuda|direct_copy_kernel_cuda).*"
+            },
+            {
+              "PREFIX": "memcpy",
+              "PATTERN": ".*(Memcpy DtoD|Memcpy HtoD|Memcpy DtoH).*"
+            },
+            {
+              "PREFIX": "silu",
+              "PATTERN": ".*(::silu_kernel).*"
+            },
+            {
+                "PREFIX": "torch_add",
+                "PATTERN": ".*(at::native::CUDAFunctor_add).*"
+            },
+            {
+                "PREFIX": "torch_mul",
+                "PATTERN": ".*(at::native::binary_internal::MulFunctor).*"
+            },
+            {
+              "PREFIX": "other",
+              "PATTERN": null
+            }
+          ]
+        }
+      }
+    ]
+}
