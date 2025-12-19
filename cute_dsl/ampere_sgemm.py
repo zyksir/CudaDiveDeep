@@ -580,26 +580,26 @@ def test_sgemm():
     C_layout_demo_tensor.element_type = cutlass.Float32
     C_tiled_demo_tensor.element_type = cutlass.Float32
 
-    # sgemm_layout_demo = SGEMM_layout_demo()
-    # compile_key = (M, N, K, 1)
-    # if compile_key not in test_sgemm.compile_cache:
-    #     test_sgemm.compile_cache[compile_key] = cute.compile(sgemm_layout_demo, A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
-    # test_sgemm.compile_cache[compile_key](A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
+    sgemm_layout_demo = SGEMM_layout_demo()
+    compile_key = (M, N, K, 1)
+    if compile_key not in test_sgemm.compile_cache:
+        test_sgemm.compile_cache[compile_key] = cute.compile(sgemm_layout_demo, A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
+    test_sgemm.compile_cache[compile_key](A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
 
-    # torch.cuda.synchronize()
-    # if torch.equal(C_layout_demo, C_ref):
-    #     print("layout demo success")
-    # else:
-    #     print(f"layout demo failed: {C_layout_demo=}, {C_layout_demo.shape=}\n{C_ref=}, {C_ref.shape=}")
-    # avg_time_us = testing.benchmark(
-    #     test_sgemm.compile_cache[compile_key],
-    #     workspace_generator=generate_tensors,
-    #     workspace_count=1,
-    #     stream=current_stream,
-    #     warmup_iterations=20,
-    #     iterations=100,
-    # )
-    # print(f"layout demo kernel execution time: {avg_time_us / 1e3:.4f} ms, {GFLOPS / avg_time_us * 1e3:.4f} GFLOPS")
+    torch.cuda.synchronize()
+    if torch.equal(C_layout_demo, C_ref):
+        print("layout demo success")
+    else:
+        print(f"layout demo failed: {C_layout_demo=}, {C_layout_demo.shape=}\n{C_ref=}, {C_ref.shape=}")
+    avg_time_us = testing.benchmark(
+        test_sgemm.compile_cache[compile_key],
+        workspace_generator=generate_tensors,
+        workspace_count=1,
+        stream=current_stream,
+        warmup_iterations=20,
+        iterations=100,
+    )
+    print(f"layout demo kernel execution time: {avg_time_us / 1e3:.4f} ms, {GFLOPS / avg_time_us * 1e3:.4f} GFLOPS")
 
     sgemm_tiled_demo = SGEMM_tiled_demo()
     compile_key = (M, N, K, 2)
