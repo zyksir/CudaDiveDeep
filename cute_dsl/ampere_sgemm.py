@@ -4,8 +4,9 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-from typing import Tuple
 import cutlass.cute.testing as testing
+from typing import Tuple
+from types import SimpleNamespace
 
 class SGEMM_layout_demo:
 
@@ -479,7 +480,7 @@ class SGEMM_tiled_demo:
             cute.autovec_copy(tCsB_p[None, None, 0], tCrB[None, None, 0])
 
         for _ in range(K_TILE_COUNT):
-            for k_mma in range(NUM_MMA, unroll_full=True):
+            for k_mma in cutlass.range(NUM_MMA, unroll_full=True):
                 if k_mma == NUM_MMA - 1:
                     tCsA_p = tCsA[None, None, None, smem_pipe_read]
                     tCsB_p = tCsB[None, None, None, smem_pipe_read]
@@ -544,6 +545,439 @@ class SGEMM_tiled_demo:
         cute.copy(atom, tCrC, tCgC, pred=predC)
         return
 
+class SGEMM_Modularized:
+    def __init__(
+        self,
+        cta_tiler: Tuple[int, int, int] = (128, 128, 8),
+        num_threads: int = 256,
+        num_stages: int = 3,
+    ):
+        self.cta_tiler = cta_tiler
+        self.num_threads = num_threads
+        self.num_stages = num_stages
+        self.BLK_M, self.BLK_N, self.BLK_K = self.cta_tiler
+    
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor, # ((M, K); (1, M))
+        mB: cute.Tensor, # ((N, K); (1, N))
+        mC: cute.Tensor, # ((M, N); (1, M))
+        stream: cuda.CUstream,
+    ):
+        M, N = cute.size(mC.shape[0]), cute.size(mC.shape[1])
+        self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
+        self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
+        self.c_major_mode = utils.LayoutEnum.from_tensor(mC)
+        TC = cutlass.Float32
+
+        if cutlass.const_expr(self.a_major_mode == utils.LayoutEnum.COL_MAJOR):
+            print(f"[tiled sgemm] {mA.type=} {mA.layout.max_alignment=}")
+            num_vectorized = 4 if (mA.layout.max_alignment % 16 == 0) else 1
+            atom_async_copy_A = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mA.element_type,
+                num_bits_per_copy=mA.element_type.width * num_vectorized,
+            )
+            CPY_M = self.BLK_M // num_vectorized
+            tA = cute.make_layout((CPY_M, self.num_threads // CPY_M))
+            vA = cute.make_layout((num_vectorized, 1))
+        else:
+            num_vectorized = 1
+            atom_async_copy_A = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mA.element_type,
+                num_bits_per_copy=mA.element_type.width * num_vectorized,
+            )
+            CPY_K = self.BLK_K // num_vectorized
+            tA = cute.make_layout((self.num_threads // CPY_K, CPY_K), stride=(CPY_K, 1))
+            vA = cute.make_layout((1, num_vectorized))
+
+        if cutlass.const_expr(self.b_major_mode == utils.LayoutEnum.COL_MAJOR):
+            print(f"[tiled sgemm] {mB.layout.max_alignment=}")
+            num_vectorized = 4 if (mB.layout.max_alignment % 16 == 0) else 1
+            atom_async_copy_B = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mB.element_type,
+                num_bits_per_copy=mB.element_type.width * num_vectorized,
+            )
+            CPY_N = self.BLK_N // num_vectorized
+            tB = cute.make_layout((CPY_N, self.num_threads // CPY_N))
+            vB = cute.make_layout((num_vectorized, 1))
+        else:
+            num_vectorized = 1
+            atom_async_copy_B = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mB.element_type,
+                num_bits_per_copy=mB.element_type.width * num_vectorized,
+            )
+            CPY_K = self.BLK_K // num_vectorized
+            tB = cute.make_layout((self.num_threads // CPY_K, CPY_K), stride=(CPY_K, 1))
+            vB = cute.make_layout((1, num_vectorized))
+
+        tiled_copy_A = cute.make_tiled_copy_tv(atom_async_copy_A, tA, vA)
+        tiled_copy_B = cute.make_tiled_copy_tv(atom_async_copy_B, tB, vB)
+
+        if cutlass.const_expr(self.c_major_mode == utils.LayoutEnum.COL_MAJOR):
+            atoms_layout = cute.make_layout(
+                (16, self.num_threads // 16, 1), stride=(1, 16, 0)
+            )
+        else:
+            atoms_layout = cute.make_layout(
+                (self.num_threads // 16, 16, 1), stride=(16, 1, 0)
+            )
+        op = cute.nvgpu.MmaUniversalOp(TC)
+        permutation_tiler_M = cute.make_layout((atoms_layout.shape[0], 4), stride=(4, 1))
+        permutation_tiler_N = cute.make_layout((atoms_layout.shape[1], 4), stride=(4, 1))
+        tiled_mma = cute.make_tiled_mma(
+            op,
+            atoms_layout,
+            # permutation_mnk=(permutation_tiler_M, permutation_tiler_N, None),
+        )
+        print("[modularized sgemm] {}".format(tiled_mma))
+
+        grid_dim = (cute.ceil_div(M, self.BLK_M), cute.ceil_div(N, self.BLK_N), 1)
+        block_dim = (cute.size(atoms_layout), 1, 1)
+        sA_layout = cute.make_layout((self.BLK_M, self.BLK_K, self.num_stages))
+        sB_layout = cute.make_layout((self.BLK_N, self.BLK_K, self.num_stages))
+        assert cute.size(tiled_copy_A) == self.num_threads
+        assert cute.size(tiled_copy_B) == self.num_threads
+        assert cute.size(tiled_mma) == self.num_threads
+        self.kernel(
+            mA,
+            mB,
+            mC,
+            sA_layout,
+            sB_layout,
+            tiled_copy_A,
+            tiled_copy_B,
+            tiled_mma,
+        ).launch(
+            grid=grid_dim,
+            block=block_dim,
+            stream=stream,
+        )
+    
+    @cute.kernel
+    def kernel(
+        self,
+        mA: cute.Tensor, # ((M, K); (1, M))
+        mB: cute.Tensor, # ((N, K); (1, N))
+        mC: cute.Tensor, # ((M, N); (1, M))
+        sA_layout: cute.Layout, # (BLK_M, BLK_K)
+        sB_layout: cute.Layout, # (BLK_N, BLK_K)
+        tiled_copy_A: cute.TiledCopy,
+        tiled_copy_B: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
+        tiler_coord = (bidx, bidy, None)
+
+        gA = cute.local_tile(mA, self.cta_tiler, tiler_coord, proj=(1, None, 1))
+        gB = cute.local_tile(mB, self.cta_tiler, tiler_coord, proj=(None, 1, 1))
+        gC = cute.local_tile(mC, self.cta_tiler, tiler_coord, proj=(1, 1, None))
+        # Move the pointer of gA/gB in the `-k` direction, 
+        # so that the first tile is irregular with [-residue_k, -1] in K dimension
+        residue_k = mA.shape[1] - gA.shape[2] * cutlass.Int32(self.BLK_K)
+        gA = cute.domain_offset((0, residue_k, 0), gA)
+        gB = cute.domain_offset((0, residue_k, 0), gB)
+
+        mcA = cute.make_identity_tensor(mA.shape)
+        mcB = cute.make_identity_tensor(mB.shape)
+        cA = cute.local_tile(mcA, self.cta_tiler, tiler_coord, proj=(1, None, 1))
+        cB = cute.local_tile(mcB, self.cta_tiler, tiler_coord, proj=(None, 1, 1))
+        cA = cute.domain_offset((0, residue_k, 0), cA)
+        cB = cute.domain_offset((0, residue_k, 0), cB)
+
+        smem = cutlass.utils.SmemAllocator()
+        sA = smem.allocate_tensor(mA.element_type, sA_layout, 16)
+        sB = smem.allocate_tensor(mB.element_type, sB_layout, 16)
+
+        basic_params = SimpleNamespace(
+            bidx=bidx, bidy=bidy,
+            mA=mA, mB=mB, mC=mC,
+            gA=gA, gB=gB, gC=gC,
+            cA=cA, cB=cB,
+            sA=sA, sB=sB,
+        )
+
+        thr_copy_A = tiled_copy_A.get_slice(tidx)
+        thr_copy_B = tiled_copy_B.get_slice(tidx)
+        tAgA = thr_copy_A.partition_S(gA)
+        tAsA = thr_copy_A.partition_D(sA)
+        tBgB = thr_copy_B.partition_S(gB)
+        tBsB = thr_copy_B.partition_D(sB)
+
+        tAcA = thr_copy_A.partition_S(cA)
+        tBcB = thr_copy_B.partition_S(cB)
+        tApA = cute.make_fragment(
+            cute.make_layout(
+                (
+                    tAsA.shape[0][1],
+                    cute.size(tAsA, mode=[1]),
+                    cute.size(tAsA, mode=[2]),
+                ),
+                stride=(cute.size(tAsA, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        tBpB = cute.make_fragment(
+            cute.make_layout(
+                (
+                    tBsB.shape[0][1],
+                    cute.size(tBsB, mode=[1]),
+                    cute.size(tBsB, mode=[2]),
+                ),
+                stride=(cute.size(tBsB, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        tApA_residue_k = cute.make_fragment(
+            cute.make_layout(
+                (
+                    tAsA.shape[0][1],
+                    cute.size(tAsA, mode=[1]),
+                    cute.size(tAsA, mode=[2]),
+                ),
+                stride=(
+                    cute.size(tAsA, mode=[1]) * cute.size(tAsA, mode=[2]),
+                    cute.size(tAsA, mode=[2]),
+                    1,
+                ),
+            ),
+            cutlass.Boolean,
+        )
+        tBpB_residue_k = cute.make_fragment(
+            cute.make_layout(
+                (
+                    tBsB.shape[0][1],
+                    cute.size(tBsB, mode=[1]),
+                    cute.size(tBsB, mode=[2]),
+                ),
+                stride=(
+                    cute.size(tBsB, mode=[1]) * cute.size(tBsB, mode=[2]),
+                    cute.size(tBsB, mode=[2]),
+                    1,
+                ),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in range(tApA.shape[0]):
+            for cpy_m in range(tApA.shape[1]):
+                coord_A = tAcA[(0, rest_v), cpy_m, 0, 0]
+                tApA[rest_v, cpy_m, 0] = cute.elem_less(coord_A[0], mA.shape[0])
+        for rest_v in range(tBpB.shape[0]):
+            for cpy_n in range(tBpB.shape[1]):
+                coord_B = tBcB[(0, rest_v), cpy_n, 0, 0]
+                tBpB[rest_v, cpy_n, 0] = cute.elem_less(coord_B[0], mB.shape[0])
+        for rest_v in range(tApA_residue_k.shape[0]):
+            for cpy_m in range(tApA_residue_k.shape[1]):
+                for cpy_k in range(tApA_residue_k.shape[2]):
+                    coord_A = tAcA[(0, rest_v), cpy_m, cpy_k, 0]
+                    tApA_residue_k[rest_v, cpy_m, cpy_k] = cute.elem_less(
+                        (coord_A[0], cutlass.Int32(-1)), (mA.shape[0], coord_A[1])
+                    )
+        for rest_v in range(tBpB_residue_k.shape[0]):
+            for cpy_n in range(tBpB_residue_k.shape[1]):
+                for cpy_k in range(tBpB_residue_k.shape[2]):
+                    coord_B = tBcB[(0, rest_v), cpy_n, cpy_k, 0]
+                    tBpB_residue_k[rest_v, cpy_n, cpy_k] = cute.elem_less(
+                        (coord_B[0], cutlass.Int32(-1)), (mB.shape[0], coord_B[1])
+                    )
+
+        NUM_G2S_PIPE = cute.size(tAsA, mode=[3])
+        K_TILE_COUNT = cute.size(tAgA, mode=[3])
+
+        gmem_copy_params = SimpleNamespace(
+            tiled_copy_A=tiled_copy_A,
+            tiled_copy_B=tiled_copy_B,
+            tAgA=tAgA,
+            tAsA=tAsA,
+            tBgB=tBgB,
+            tBsB=tBsB,
+            tApA_residue_k=tApA_residue_k,
+            tBpB_residue_k=tBpB_residue_k,
+            tApA=tApA,
+            tBpB=tBpB,
+            gmem_pipe_read=cute.Int32(0),
+        )
+
+        thr_mma = tiled_mma.get_slice(tidx)
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCgC = thr_mma.partition_C(gC)
+        tCrC = thr_mma.make_fragment_C(tCgC)
+        tCrC.fill(0.0)
+        tCrA = thr_mma.make_fragment_A(tCsA[None, None, None, 0])
+        tCrB = thr_mma.make_fragment_B(tCsB[None, None, None, 0])
+        NUM_MMA = cute.size(tCrA, mode=[2])
+        mma_params = SimpleNamespace(
+            thr_mma=thr_mma,
+            tiled_mma=tiled_mma,
+            tCrC=tCrC,
+            tCrA=tCrA,
+            tCrB=tCrB,
+        )
+
+        smem_copy_params = SimpleNamespace(
+            tCsA=tCsA,
+            tCsB=tCsB,
+            tCgC=tCgC,
+            smem_pipe_read=cute.Int32(0),
+            smem_pipe_write=cute.Int32(NUM_G2S_PIPE - 1),
+        )
+
+        self._prefetch_gmem_to_smem(basic_params, gmem_copy_params, K_TILE_COUNT, NUM_G2S_PIPE)
+        self._main_loop(basic_params, gmem_copy_params, smem_copy_params, mma_params, NUM_MMA, K_TILE_COUNT, NUM_G2S_PIPE)
+        self._epilogue(basic_params, smem_copy_params, mma_params)
+
+    @cute.jit
+    def _prefetch_gmem_to_smem(
+        self,
+        basic_params: SimpleNamespace,
+        gmem_copy_params: SimpleNamespace,
+        K_TILE_COUNT: cutlass.Constexpr,
+        NUM_G2S_PIPE: cutlass.Constexpr,
+    ):
+        """Prefetch global memory to shared memory.
+        """
+        cute.copy(
+            gmem_copy_params.tiled_copy_A,
+            gmem_copy_params.tAgA[None, None, None, gmem_copy_params.gmem_pipe_read],
+            gmem_copy_params.tAsA[None, None, None, 0],
+            pred=gmem_copy_params.tApA_residue_k,
+        )
+        cute.copy(
+            gmem_copy_params.tiled_copy_B,
+            gmem_copy_params.tBgB[None, None, None, gmem_copy_params.gmem_pipe_read],
+            gmem_copy_params.tBsB[None, None, None, 0],
+            pred=gmem_copy_params.tBpB_residue_k,
+        )
+        cute.arch.cp_async_commit_group()
+        gmem_copy_params.gmem_pipe_read = (
+            gmem_copy_params.gmem_pipe_read + 1
+            if gmem_copy_params.gmem_pipe_read + 1 < K_TILE_COUNT
+            else cutlass.Int32(0)
+        )
+        for k_tile_idx in range(1, NUM_G2S_PIPE - 1):
+            if k_tile_idx < K_TILE_COUNT:
+                cute.copy(
+                    gmem_copy_params.tiled_copy_A,
+                    gmem_copy_params.tAgA[None, None, None, gmem_copy_params.gmem_pipe_read],
+                    gmem_copy_params.tAsA[None, None, None, k_tile_idx],
+                    pred=gmem_copy_params.tApA,
+                )
+                cute.copy(
+                    gmem_copy_params.tiled_copy_B,
+                    gmem_copy_params.tBgB[None, None, None, gmem_copy_params.gmem_pipe_read],
+                    gmem_copy_params.tBsB[None, None, None, k_tile_idx],
+                    pred=gmem_copy_params.tBpB,
+                )
+            gmem_copy_params.gmem_pipe_read = (
+                gmem_copy_params.gmem_pipe_read + 1
+                if gmem_copy_params.gmem_pipe_read + 1 < K_TILE_COUNT
+                else cutlass.Int32(0)
+            )
+            cute.arch.cp_async_commit_group()
+        
+        if K_TILE_COUNT < NUM_G2S_PIPE:
+            for rest_v in range(gmem_copy_params.tApA.shape[0]):
+                for cpy_m in range(gmem_copy_params.tApA.shape[1]):
+                    gmem_copy_params.tApA[rest_v, cpy_m, 0] = cutlass.Boolean(0)
+            for rest_v in range(gmem_copy_params.tBpB.shape[0]):
+                for cpy_n in range(gmem_copy_params.tBpB.shape[1]):
+                    gmem_copy_params.tBpB[rest_v, cpy_n, 0] = cutlass.Boolean(0)
+        
+        
+    @cute.jit
+    def _main_loop(
+        self,
+        basic_params: SimpleNamespace,
+        gmem_copy_params: SimpleNamespace,
+        smem_copy_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        NUM_MMA: cutlass.Constexpr,
+        K_TILE_COUNT: cutlass.Constexpr,
+        NUM_G2S_PIPE: cutlass.Constexpr,
+    ):
+        tCsA_p = smem_copy_params.tCsA[None, None, None, smem_copy_params.smem_pipe_read]
+        tCsB_p = smem_copy_params.tCsB[None, None, None, smem_copy_params.smem_pipe_read]
+        if NUM_MMA > 1:
+            # barrier: wait gmem -> smem
+            cute.arch.cp_async_wait_group(NUM_G2S_PIPE - 2)
+            cute.arch.barrier()
+
+            # smem -> regs
+            cute.autovec_copy(tCsA_p[None, None, 0], mma_params.tCrA[None, None, 0])
+            cute.autovec_copy(tCsB_p[None, None, 0], mma_params.tCrB[None, None, 0])
+        for _ in range(K_TILE_COUNT):
+            for k_mma in range(NUM_MMA, unroll_full=True):
+                if k_mma == NUM_MMA - 1:
+                    tCsA_p = smem_copy_params.tCsA[None, None, None, smem_copy_params.smem_pipe_read]
+                    tCsB_p = smem_copy_params.tCsB[None, None, None, smem_copy_params.smem_pipe_read]
+                    cute.arch.cp_async_wait_group(NUM_G2S_PIPE - 2)
+                    cute.arch.barrier()
+                    
+                # 1. Load A, B from shared memory to registers for k_block + 1
+                k_mma_next = (k_mma + 1) % NUM_MMA  # static
+                cute.autovec_copy(
+                    tCsA_p[None, None, k_mma_next],
+                    mma_params.tCrA[None, None, k_mma_next],
+                )
+                cute.autovec_copy(
+                    tCsB_p[None, None, k_mma_next],
+                    mma_params.tCrB[None, None, k_mma_next],
+                )
+
+                if k_mma == 0:
+                    cute.copy(
+                        gmem_copy_params.tiled_copy_A,
+                        gmem_copy_params.tAgA[None, None, None, gmem_copy_params.gmem_pipe_read],
+                        gmem_copy_params.tAsA[None, None, None, smem_copy_params.smem_pipe_write],
+                        pred=gmem_copy_params.tApA,
+                    )
+                cute.gemm(
+                    mma_params.tiled_mma,
+                    mma_params.tCrC,
+                    mma_params.tCrA[None, None, k_mma],
+                    mma_params.tCrB[None, None, k_mma],
+                    mma_params.tCrC,
+                )
+                if k_mma == 0:
+                    cute.copy(
+                        gmem_copy_params.tiled_copy_B,
+                        gmem_copy_params.tBgB[None, None, None, gmem_copy_params.gmem_pipe_read],
+                        gmem_copy_params.tBsB[None, None, None, smem_copy_params.smem_pipe_write],
+                        pred=gmem_copy_params.tBpB,
+                    )
+                    cute.arch.cp_async_commit_group()
+                    smem_copy_params.smem_pipe_write = smem_copy_params.smem_pipe_read
+                    smem_copy_params.smem_pipe_read = smem_copy_params.smem_pipe_read + 1
+                    if smem_copy_params.smem_pipe_read == NUM_G2S_PIPE:
+                        smem_copy_params.smem_pipe_read = cute.Int32(0)
+                    gmem_copy_params.gmem_pipe_read = (
+                        gmem_copy_params.gmem_pipe_read + 1
+                        if gmem_copy_params.gmem_pipe_read + 1 < K_TILE_COUNT
+                        else cute.Int32(1)
+                    )
+
+        # Epilogue        
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+    @cute.jit
+    def _epilogue(self, basic_params: SimpleNamespace, smem_copy_params: SimpleNamespace, mma_params: SimpleNamespace):
+        cC = cute.make_identity_tensor(basic_params.gC.shape)
+        tCpC = mma_params.thr_mma.partition_C(cC)
+        predC = cute.make_fragment(mma_params.tCrC.layout, cutlass.Boolean)
+        residue_m = basic_params.mC.shape[0] - cutlass.Int32(self.BLK_M) * basic_params.bidx
+        residue_n = basic_params.mC.shape[1] - cutlass.Int32(self.BLK_N) * basic_params.bidy
+        for i in range(cute.size(mma_params.tCrC.shape)):
+            predC[i] = cute.elem_less(tCpC[i], (residue_m, residue_n))
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), basic_params.mC.element_type)
+        cute.copy(atom, mma_params.tCrC, smem_copy_params.tCgC, pred=predC)
+
 
 def test_sgemm():
     device = "cuda"
@@ -580,28 +1014,28 @@ def test_sgemm():
     C_layout_demo_tensor.element_type = cutlass.Float32
     C_tiled_demo_tensor.element_type = cutlass.Float32
 
-    sgemm_layout_demo = SGEMM_layout_demo()
-    compile_key = (M, N, K, 1)
-    if compile_key not in test_sgemm.compile_cache:
-        test_sgemm.compile_cache[compile_key] = cute.compile(sgemm_layout_demo, A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
-    test_sgemm.compile_cache[compile_key](A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
+    # sgemm_layout_demo = SGEMM_layout_demo()
+    # compile_key = (M, N, K, 1)
+    # if compile_key not in test_sgemm.compile_cache:
+    #     test_sgemm.compile_cache[compile_key] = cute.compile(sgemm_layout_demo, A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
+    # test_sgemm.compile_cache[compile_key](A_tensor, B_tensor, C_layout_demo_tensor, current_stream)
 
-    torch.cuda.synchronize()
-    if torch.equal(C_layout_demo, C_ref):
-        print("layout demo success")
-    else:
-        print(f"layout demo failed: {C_layout_demo=}, {C_layout_demo.shape=}\n{C_ref=}, {C_ref.shape=}")
-    avg_time_us = testing.benchmark(
-        test_sgemm.compile_cache[compile_key],
-        workspace_generator=generate_tensors,
-        workspace_count=1,
-        stream=current_stream,
-        warmup_iterations=20,
-        iterations=100,
-    )
-    print(f"layout demo kernel execution time: {avg_time_us / 1e3:.4f} ms, {GFLOPS / avg_time_us * 1e3:.4f} GFLOPS")
+    # torch.cuda.synchronize()
+    # if torch.equal(C_layout_demo, C_ref):
+    #     print("layout demo success")
+    # else:
+    #     print(f"layout demo failed: {C_layout_demo=}, {C_layout_demo.shape=}\n{C_ref=}, {C_ref.shape=}")
+    # avg_time_us = testing.benchmark(
+    #     test_sgemm.compile_cache[compile_key],
+    #     workspace_generator=generate_tensors,
+    #     workspace_count=1,
+    #     stream=current_stream,
+    #     warmup_iterations=20,
+    #     iterations=100,
+    # )
+    # print(f"layout demo kernel execution time: {avg_time_us / 1e3:.4f} ms, {GFLOPS / avg_time_us * 1e3:.4f} GFLOPS")
 
-    sgemm_tiled_demo = SGEMM_tiled_demo()
+    sgemm_tiled_demo = SGEMM_Modularized()
     compile_key = (M, N, K, 2)
     if compile_key not in test_sgemm.compile_cache:
         test_sgemm.compile_cache[compile_key] = cute.compile(sgemm_tiled_demo, A_tensor, B_tensor, C_tiled_demo_tensor, current_stream)

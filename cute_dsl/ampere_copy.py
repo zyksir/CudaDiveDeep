@@ -136,3 +136,9 @@ if __name__ == "__main__":
         compile_cache[compile_key] = cute.compile(naive_copy, A_cute_tensor, B_cute_tensor, current_stream)
     compile_cache[compile_key](A_cute_tensor, B_cute_tensor, current_stream)
     assert torch.equal(A, B)
+
+    from utils import run_benchmark
+    base_time = run_benchmark(10, 10, lambda: A.reshape(M, N).permute(1, 0))
+    print(f"Base time: {base_time} milliseconds")
+    ampere_copy_time = run_benchmark(10, 10, compile_cache[compile_key], A_cute_tensor, B_cute_tensor, current_stream)
+    print(f"Ampere COPY time: {ampere_copy_time} milliseconds")
